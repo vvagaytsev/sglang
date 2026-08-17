@@ -25,7 +25,7 @@ SPARSE_KV_FP8_DTYPES = (
 def check_sparse_kv_fp8(
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    v_cache: Optional[torch.Tensor],
     *,
     label: str,
 ) -> bool:
@@ -34,6 +34,9 @@ def check_sparse_kv_fp8(
     Returns True iff the K cache is fp8 (then widened to Q dtype in the kernel).
     Raises AssertionError otherwise, mirroring the contract the decode and prefill
     topk kernels both enforce. fp8 is accepted on both HIP and CUDA.
+
+    v_cache is None on the score-only paths (disable_index_value), which score
+    blocks from K alone and never load V; there is no V dtype to check there.
     """
     assert q.dtype in (torch.bfloat16, torch.float16)
     is_fp8 = k_cache.dtype in SPARSE_KV_FP8_DTYPES
@@ -41,7 +44,8 @@ def check_sparse_kv_fp8(
         f"sparse {label} expects K cache dtype == Q dtype ({q.dtype}) "
         f"or fp8, got {k_cache.dtype}"
     )
-    assert v_cache.dtype == k_cache.dtype
+    if v_cache is not None:
+        assert v_cache.dtype == k_cache.dtype
     return is_fp8
 
 

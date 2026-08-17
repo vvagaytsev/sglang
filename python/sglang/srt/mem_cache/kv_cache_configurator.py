@@ -1246,17 +1246,19 @@ class KVCacheConfigurator:
         # to halve score-kernel bandwidth. Default stays the model dtype; the score
         # kernels widen fp8 on load (IS_FP8).
         index_dtype = self.model_dtype
-        if envs.SGLANG_MINIMAX_FP8_INDEX_K.get():
+        fp8_index_k = envs.SGLANG_MINIMAX_FP8_INDEX_K.get()
+        if fp8_index_k:
             from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
             index_dtype = (
                 torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
             )
-            logger.info(
-                "SILOTIGER-788: MiniMax sparse index-K cache stored as "
-                "%s (fp8 index-K enabled)",
-                index_dtype,
-            )
+        logger.info(
+            "MiniMax sparse index-K cache dtype=%s "
+            "(SGLANG_MINIMAX_FP8_INDEX_K=%d)",
+            index_dtype,
+            int(fp8_index_k),
+        )
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.server_args.page_size,
