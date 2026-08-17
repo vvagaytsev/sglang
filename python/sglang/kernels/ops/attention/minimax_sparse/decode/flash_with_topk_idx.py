@@ -7,13 +7,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
 
-from ..common.utils import _bitonic_merge, robust_allocator
-
-_is_hip = is_hip()
-# fp8 dtypes accepted for the (unit-scaled) index-K cache on HIP.
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
+from ..common.utils import _bitonic_merge, check_sparse_kv_fp8, robust_allocator
 
 
 @triton.heuristics(
@@ -795,17 +790,11 @@ def flash_decode_with_topk_idx(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check: Q is always bf16/fp16; K cache may be fp8 only on HIP
-    # (widened to Q dtype on load). CUDA still requires K dtype == Q dtype.
-    assert q.dtype in (torch.bfloat16, torch.float16)
-    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
-    assert k_cache.dtype == q.dtype or is_fp8, (
-        f"sparse decode score expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8 on HIP, got {k_cache.dtype}"
-    )
+    # dtype check: Q is always bf16/fp16; the index-K cache may be fp8, which the
+    # kernels widen back to the Q dtype on load (IS_FP8).
     if not disable_index_value:
         assert v_cache is not None
-        assert v_cache.dtype == k_cache.dtype
+    is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode index scoring")
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape

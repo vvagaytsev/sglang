@@ -6,13 +6,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
-
-from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
-
-_is_hip = is_hip()
-# fp8 dtypes accepted for the (unit-scaled) index-K cache on HIP.
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
+from ..common.utils import (
+    _bitonic_merge,
+    check_sparse_kv_fp8,
+    get_cu_seqblocks,
+    robust_allocator,
+)
 
 
 @triton.heuristics(
@@ -459,13 +458,13 @@ def flash_prefill_with_topk_index(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check: Q is always bf16/fp16; K cache may be fp8 only on HIP
-    # (widened to Q dtype on load). CUDA still requires K dtype == Q dtype.
-    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
-    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
-    assert k_cache.dtype == q.dtype or is_fp8, (
-        f"sparse prefill score expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8 on HIP, got {k_cache.dtype}"
+    # dtype check: Q is always bf16/fp16; the index-K cache may be fp8, which the
+    # kernel widens back to the Q dtype on load (IS_FP8).
+    is_fp8 = check_sparse_kv_fp8(
+        q,
+        k_cache,
+        None if disable_index_value else v_cache,
+        label="prefill index scoring",
     )
     assert cu_seqlens.dtype == torch.int32
     # shape
@@ -475,7 +474,7 @@ def flash_prefill_with_topk_index(
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
     else:
-        assert v_cache is not None and v_cache.dtype == k_cache.dtype
+        assert v_cache is not None
         assert v_cache.shape[1] == k_cache.shape[1]
         v_head_dim = v_cache.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
