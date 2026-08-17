@@ -1098,6 +1098,10 @@ class Envs:
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q = EnvInt(0)
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K = EnvInt(0)
 
+    # Store the MiniMax sparse index-K cache as unit-scaled fp8 instead of bf16 to
+    # halve score-kernel bandwidth; the score kernels widen it back on load.
+    SGLANG_MINIMAX_FP8_INDEX_K = EnvBool(False)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
