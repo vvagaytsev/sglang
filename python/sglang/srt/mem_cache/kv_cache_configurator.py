@@ -1242,11 +1242,26 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        # Opt in to fp8 (unit-scaled) index-K cache via SGLANG_MINIMAX_FP8_INDEX_K=1
+        # to halve score-kernel bandwidth. Default stays the model dtype; the score
+        # kernels widen fp8 on load (IS_FP8).
+        index_dtype = self.model_dtype
+        if envs.SGLANG_MINIMAX_FP8_INDEX_K.get():
+            from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+
+            index_dtype = (
+                torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+            )
+            logger.info(
+                "SILOTIGER-788: MiniMax sparse index-K cache stored as "
+                "%s (fp8 index-K enabled)",
+                index_dtype,
+            )
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
-            index_dtype=self.model_dtype,
+            index_dtype=index_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],
