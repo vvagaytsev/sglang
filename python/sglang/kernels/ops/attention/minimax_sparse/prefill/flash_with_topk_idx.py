@@ -9,6 +9,38 @@ import triton.language as tl
 from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 
 
+# Score-only path (DISABLE_INDEX_VALUE=True), i.e. every sparse layer of MiniMax-M3.
+# BLOCK_SIZE_Q=64 halves the workgroup count vs BLOCK_SIZE_Q=32, keeping a
+# chunked-prefill-8192 step at ~128 workgroups instead of ~256. That matters because
+# BLOCK_SIZE_K=256 costs 132 KB of the 160 KB LDS/CU, so only one workgroup is
+# resident per CU: crossing 256 active workgroups serializes into a second wave and
+# ~1.9x the latency, with no partial-occupancy cushion.
+_SCORE_ONLY_CONFIG = triton.Config(
+    {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2
+)
+
+# DISABLE_INDEX_VALUE=False also stages a V tile, and BLOCK_SIZE_K=256 then needs
+# 305072 B > the 163840 B LDS limit. Every BLOCK_SIZE_K=256 config is unusable here,
+# so this path needs its own BLOCK_SIZE_K<=128 config.
+_WITH_INDEX_VALUE_CONFIG = triton.Config(
+    {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
+)
+
+
+def _select_config(configs, named_args, **kwargs):
+    """Pick the config by code path instead of letting autotune benchmark for it.
+
+    The autotune key holds only dtype/layout constexprs, so it cannot see the token
+    layout that actually decides the winner. Autotune therefore measures whichever
+    shape a process happens to run first and reuses that choice for every later
+    shape -- and on a short warmup shape the two configs tie, so it can settle on
+    the slower one for the whole process. Forcing the mapping keeps selection
+    deterministic across restarts.
+    """
+    disable_index_value = {**named_args, **kwargs}["DISABLE_INDEX_VALUE"]
+    return [_SCORE_ONLY_CONFIG if disable_index_value else _WITH_INDEX_VALUE_CONFIG]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -18,36 +50,10 @@ from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 )
 @triton.autotune(
     configs=[
-        # Small block (64x64): low shared mem, can use higher num_stages
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
-        ),
-        # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
-        ),
-        # Large block (128x128): high shared mem, ns=2,3 only, nw=8
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
+        # _select_config forces one of these two per code path, so nothing here is
+        # benchmarked against anything else.
+        _SCORE_ONLY_CONFIG,
+        _WITH_INDEX_VALUE_CONFIG,
     ],
     key=[
         "qk_head_dim",
@@ -57,6 +63,7 @@ from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
     ],
+    prune_configs_by={"early_config_prune": _select_config},
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
