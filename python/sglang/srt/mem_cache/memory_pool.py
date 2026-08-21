@@ -132,9 +132,27 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-def _kv_scale_divides(scale: Optional[float]) -> TypeGuard[float]:
-    """Host scalar only: reading a device tensor would sync, illegal under graph capture."""
-    return scale is not None and scale != 1.0
+def _kv_scale_divides(
+    scale: Optional[Union[float, torch.Tensor]],
+) -> TypeGuard[Union[float, torch.Tensor]]:
+    """Whether dividing by ``scale`` would change any value.
+
+    Case 1, ``None``: no scale was supplied, so there is nothing to apply.
+
+    Case 2, a tensor: this is ``layer.k_scale``, the Parameter that
+    ``BaseKVCacheMethod.create_weights`` allocates and weight loading fills. Reading
+    its value would copy device to host, stalling on the GPU and breaking CUDA-graph
+    capture, so assume it matters and divide.
+
+    Case 3, a float: already on the host, so compare it and skip the divide when it
+    is exactly 1.0. For example, the MiniMax sparse store passes no scale argument
+    and so gets ``MiniMaxSparseKVPool.set_kv_buffer``'s 1.0 default.
+    """
+    if scale is None:
+        return False
+    if isinstance(scale, torch.Tensor):
+        return True
+    return scale != 1.0
 
 
 def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
