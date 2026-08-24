@@ -140,8 +140,9 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Rows for routes filtered to expert -1 can be left unwritten, so they must start at
-    # zero. When nothing can be filtered, the GEMM writes every row and the fill is dead.
+    # Keep zero-fill: moe_align_block_size reserves an extra expert bucket for
+    # filtered routes, which should contribute zeros if present. But every row is
+    # overwritten when no route can be filtered, so `torch.empty` skips the fill.
     alloc = torch.zeros if may_filter_routes else torch.empty
     out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
