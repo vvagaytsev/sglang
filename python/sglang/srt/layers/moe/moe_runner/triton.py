@@ -130,8 +130,6 @@ class TritonRunnerCore(MoeRunnerCore):
             _fused_moe_kernel_sequence,
         )
 
-        filter_expert = _needs_expert_filter(self.config)
-
         out = _fused_moe_kernel_sequence(
             runner_input.hidden_states,
             quant_info.w13_weight,
@@ -166,7 +164,7 @@ class TritonRunnerCore(MoeRunnerCore):
             routed_scaling_factor=self.config.routed_scaling_factor,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
-            filter_expert=filter_expert,
+            filter_expert=_needs_expert_filter(self.config),
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
         )
