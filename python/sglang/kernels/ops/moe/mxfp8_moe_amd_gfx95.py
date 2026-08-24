@@ -283,8 +283,6 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
-        # Every expert is local, so the clamp above cannot change any id. Keep the int32
-        # conversion: it is free once the ids already are int32, unlike `copy=True`.
         topk_ids = topk_ids.to(torch.int32)
 
     # Only the branches above can drop a route to -1.
