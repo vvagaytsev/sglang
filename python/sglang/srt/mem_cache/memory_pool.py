@@ -5033,11 +5033,11 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics).
-        main = self.main_pool
-        if main.can_store_kv_fused_cast(cache_k, cache_v):
-            main.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
+        if self.main_pool.can_store_kv_fused_cast(cache_k, cache_v):
+            # Folds the cast into the paged write: one launch, not cast + scatter.
+            self.main_pool.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
         else:
+            # Fallback: separate stores (identical semantics).
             self.set_kv_buffer(layer, loc, cache_k, cache_v)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k)
