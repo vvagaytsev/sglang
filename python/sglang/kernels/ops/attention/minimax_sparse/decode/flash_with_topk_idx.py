@@ -8,7 +8,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 
-from ..common.utils import _bitonic_merge, robust_allocator
+from ..common.utils import _bitonic_merge, check_sparse_kv_fp8, robust_allocator
 
 
 @triton.heuristics(
@@ -33,6 +33,7 @@ from ..common.utils import _bitonic_merge, robust_allocator
         "head_dim",
         "block_size",
         "SCORE_TYPE",
+        "IS_FP8",
     ],
 )
 @triton.jit
@@ -75,6 +76,7 @@ def _decode_score_kernel(
     NUM_KV_CHUNKS: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -160,6 +162,11 @@ def _decode_score_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index-K is unit-scaled, so dequant is just a widening cast to
+            # q.dtype. When IS_FP8 is False this branch is dropped at compile
+            # time (Triton constexpr), leaving the bf16 path unchanged.
+            k = k.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
@@ -213,6 +220,7 @@ def _decode_score_kernel(
         "block_size",
         "HAS_SINK",
         "SCORE_TYPE",
+        "IS_FP8",
     ],
 )
 @triton.jit
@@ -271,6 +279,7 @@ def _decode_score_attn_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -367,6 +376,9 @@ def _decode_score_attn_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Widen unit-scaled fp8 index-K to the Q compute dtype before tl.dot.
+            k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
         v_off = (
             slots[:, None] * stride_v_s
@@ -378,6 +390,10 @@ def _decode_score_attn_kernel(
             mask=pos_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Widen V so the later `p.to(v.dtype)` casts P to compute dtype,
+            # not fp8 (which would destroy the attention weights).
+            v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
@@ -774,14 +790,11 @@ def flash_decode_with_topk_idx(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check
-    assert (
-        q.dtype == torch.bfloat16
-        or q.dtype == torch.float16
-        and k_cache.dtype == q.dtype
-    )
+    # dtype check: Q is always bf16/fp16; the index-K cache may be fp8, which the
+    # kernels widen back to the Q dtype on load (IS_FP8).
     if not disable_index_value:
         assert v_cache is not None
+    is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode index scoring")
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
@@ -863,6 +876,7 @@ def flash_decode_with_topk_idx(
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
         )
     else:
         assert v_cache is not None
@@ -922,6 +936,7 @@ def flash_decode_with_topk_idx(
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
         )
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.

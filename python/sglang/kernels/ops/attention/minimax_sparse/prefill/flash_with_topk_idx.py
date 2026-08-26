@@ -6,7 +6,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
+from ..common.utils import (
+    _bitonic_merge,
+    check_sparse_kv_fp8,
+    get_cu_seqblocks,
+    robust_allocator,
+)
 
 
 @triton.heuristics(
@@ -56,6 +61,7 @@ from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
         "use_gumbel_topk",
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
+        "IS_FP8",
     ],
 )
 @triton.jit
@@ -112,6 +118,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     DISABLE_INDEX_VALUE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -199,6 +206,9 @@ def _flash_attn_fwd_with_block_score_kernel(
             mask=kd_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Widen unit-scaled fp8 index-K to the Q compute dtype before tl.dot.
+            k = k.to(q.dtype)
         # compute qk
         qk = tl.dot(q, k) * sm_scale_log2e
         if i >= diag_start:
@@ -251,6 +261,10 @@ def _flash_attn_fwd_with_block_score_kernel(
                 mask=pos_mask[:, None] & vd_mask[None, :],
                 other=0.0,
             )
+            if IS_FP8:
+                # Widen V so the later `p.to(v.dtype)` casts P to compute dtype,
+                # not fp8 (which would destroy the attention weights).
+                v = v.to(q.dtype)
             p = p.to(v.dtype)
             acc_o += tl.dot(p, v)
             # update statistics
@@ -444,9 +458,14 @@ def flash_prefill_with_topk_index(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check
-    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
-    assert k_cache.dtype == q.dtype
+    # dtype check: Q is always bf16/fp16; the index-K cache may be fp8, which the
+    # kernel widens back to the Q dtype on load (IS_FP8).
+    is_fp8 = check_sparse_kv_fp8(
+        q,
+        k_cache,
+        None if disable_index_value else v_cache,
+        label="prefill index scoring",
+    )
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
@@ -455,7 +474,7 @@ def flash_prefill_with_topk_index(
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
     else:
-        assert v_cache is not None and v_cache.dtype == q.dtype
+        assert v_cache is not None
         assert v_cache.shape[1] == k_cache.shape[1]
         v_head_dim = v_cache.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
@@ -529,6 +548,7 @@ def flash_prefill_with_topk_index(
         req_to_token.stride(0),
         SCORE_TYPE=score_type,
         DISABLE_INDEX_VALUE=disable_index_value,
+        IS_FP8=is_fp8,
     )
 
     # topk extraction kernel
