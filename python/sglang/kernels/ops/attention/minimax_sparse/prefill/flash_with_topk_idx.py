@@ -8,7 +8,6 @@ import triton.language as tl
 
 from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 
-
 # Score-only path (DISABLE_INDEX_VALUE=True), i.e. every sparse layer of MiniMax-M3.
 # BLOCK_SIZE_Q=64 halves the workgroup count vs BLOCK_SIZE_Q=32, keeping a
 # chunked-prefill-8192 step at ~128 workgroups instead of ~256. That matters because
@@ -41,6 +40,95 @@ def _select_config(configs, named_args, **kwargs):
     return [_SCORE_ONLY_CONFIG if disable_index_value else _WITH_INDEX_VALUE_CONFIG]
 
 
+@triton.jit
+def _topk_accumulate(
+    topk_score,  # [BLOCK_SIZE_Q, BLOCK_SIZE_T] running scores, unsorted
+    topk_idx,  # [BLOCK_SIZE_Q, BLOCK_SIZE_T] running block ids, -1 = empty slot
+    score,  # [BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK] block scores of this K tile
+    valid_blocks,  # [BLOCK_SIZE_Q] causal block count per query row
+    first_block,  # K-block index of score[:, 0]
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    BLOCKS_PER_K_BLOCK: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """Fold one K tile's block scores into the running top-k (FUSE_TOPK epilogue).
+
+    Selection is an argmin-insertion rather than the bitonic merge
+    ``_topk_index_kernel`` uses: a K tile carries only BLOCKS_PER_K_BLOCK (1-2)
+    new candidates, and a merge network costs the same for 2 candidates as for
+    32, so merging per tile would be ~12x the standalone's per-candidate cost.
+    Insertion is ~4 passes over a BLOCK_SIZE_Q x BLOCK_SIZE_T tile per candidate.
+    The array is left unsorted here and sorted once by ``_topk_sort_and_store``.
+    """
+    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    blk = first_block + off_bpk
+    # NaN breaks the epilogue's bitonic sort; -inf is the sentinel that can never
+    # win a slot below. Mirrors the scrub in _topk_index_kernel.
+    score = tl.where(score != score, float("-inf"), score)
+    # Force the init and local blocks into the selection, matching
+    # _topk_index_kernel under the shipped MASK_INIT=False / MASK_LOCAL=False.
+    # causal_mask keeps a block outside the causal window from being boosted.
+    causal_mask = blk[None, :] < valid_blocks[:, None]
+    score = tl.where(causal_mask & (blk[None, :] < init_blocks), 1e30, score)
+    local_lo = tl.maximum(valid_blocks - local_blocks, 0)
+    score = tl.where(causal_mask & (blk[None, :] >= local_lo[:, None]), 1e29, score)
+    for p in tl.static_range(BLOCKS_PER_K_BLOCK):
+        cand = tl.sum(tl.where(off_bpk[None, :] == p, score, 0.0), axis=1)
+        # Any slot holding the running minimum is a valid eviction target, so
+        # argmin's tie-break does not affect the selected set. A -inf candidate
+        # never beats the -1e30 init, so masked blocks can never be inserted.
+        # The second term compares against topk_score rather than its min: at the
+        # argmin slot the two are equal, so this is the same predicate for one
+        # cross-lane reduction instead of two.
+        hit = (off_t[None, :] == tl.argmin(topk_score, axis=1)[:, None]) & (
+            cand[:, None] > topk_score
+        )
+        topk_score = tl.where(hit, cand[:, None], topk_score)
+        topk_idx = tl.where(hit, first_block + p, topk_idx)
+    return topk_score, topk_idx
+
+
+@triton.jit
+def _topk_sort_and_store(
+    ti_ptr,  # topk_idx base, head offset already folded in
+    topk_score,
+    topk_idx,
+    row_idx,  # [BLOCK_SIZE_Q] destination row per query
+    row_valid,  # [BLOCK_SIZE_Q] rows inside q_len
+    valid_blocks,  # [BLOCK_SIZE_Q]
+    topk,
+    stride_ti_n,
+    stride_ti_t,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """Sort the running top-k by score and store it right-padded with -1.
+
+    ``topk_sparse.py`` walks ``range(sum(topk_idx >= 0))`` and multiplies each
+    entry by BLOCK_SIZE_K, so an interleaved -1 becomes a negative K position
+    that its ``pos < seq_len`` mask does not reject. Front-packing is therefore
+    a hard correctness requirement, not a convention: never-filled slots hold
+    -1e30 and sort to the back, which produces it.
+    """
+    n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_T)
+    # _bitonic_merge is row-independent for 2-D input (n_outer = numel >> n_dims),
+    # so the whole q-tile sorts in one call per stage.
+    for j in tl.static_range(1, n_dims):
+        topk_score, topk_idx = _bitonic_merge(
+            topk_score, topk_idx.to(tl.int32), j, 2, n_dims
+        )
+    topk_score, topk_idx = _bitonic_merge(
+        topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims
+    )
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    ti_ptrs = ti_ptr + row_idx[:, None] * stride_ti_n + off_t[None, :] * stride_ti_t
+    store_mask = row_valid[:, None] & (
+        off_t[None, :] < tl.minimum(topk, valid_blocks)[:, None]
+    )
+    tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=store_mask)
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -62,6 +150,8 @@ def _select_config(configs, named_args, **kwargs):
         "use_gumbel_topk",
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
+        "FUSE_TOPK",
+        "BLOCK_SIZE_T",
     ],
     prune_configs_by={"early_config_prune": _select_config},
 )
@@ -119,6 +209,19 @@ def _flash_attn_fwd_with_block_score_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     DISABLE_INDEX_VALUE: tl.constexpr,
+    # Fused block top-k (SILOTIGER-790). Everything below is defaulted so callers
+    # of the unfused path -- including the pinned launches in tmp/ that bypass
+    # @heuristics -- keep working with the original argument list.
+    topk_idx_ptr=None,  # topk_idx: h x n x topk
+    cu_seqblocks_q=None,
+    topk=0,  # not constexpr, matching _topk_index_kernel
+    stride_ti_h=0,
+    stride_ti_n=0,
+    stride_ti_t=0,
+    init_blocks: tl.constexpr = 1,
+    local_blocks: tl.constexpr = 2,
+    FUSE_TOPK: tl.constexpr = False,
+    BLOCK_SIZE_T: tl.constexpr = 1,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -149,14 +252,15 @@ def _flash_attn_fwd_with_block_score_kernel(
         block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
         order=(1, 0),
     )
-    s_ptrs = tl.make_block_ptr(
-        base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
-        shape=(q_len, block_num),
-        strides=(stride_s_q, stride_s_k),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
-        order=(1, 0),
-    )
+    if not FUSE_TOPK:
+        s_ptrs = tl.make_block_ptr(
+            base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
+            shape=(q_len, block_num),
+            strides=(stride_s_q, stride_s_k),
+            offsets=(pid_q * BLOCK_SIZE_Q, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
+            order=(1, 0),
+        )
     # load q
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
     if HAS_SINK:
@@ -184,6 +288,14 @@ def _flash_attn_fwd_with_block_score_kernel(
         m_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
     acc_o = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_VD), 0, dtype=tl.float32)
+    if FUSE_TOPK:
+        # Per-row causal block count. The scalar form in _topk_index_kernel is
+        # (prefix_len + pid_q * sample_interval + block_size) // block_size; here
+        # off_q already carries prefix_len + the row's position in the q-tile,
+        # which is the same thing at sample_interval == 1.
+        valid_blocks = (off_q + block_size) // block_size
+        topk_score = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_T), -1e30, dtype=tl.float32)
+        topk_idx = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_T), -1, dtype=tl.int32)
     # attention
     diag_start = (prefix_len + pid_q * BLOCK_SIZE_Q) // BLOCK_SIZE_K * BLOCK_SIZE_K
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
@@ -240,7 +352,22 @@ def _flash_attn_fwd_with_block_score_kernel(
             noise = tl.clamp(noise, min=1e-9, max=1 - 1e-9)  # avoid log(0)
             noise = -tl.log(-tl.log(noise)) * 1.4426950409
             score += noise
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        if FUSE_TOPK:
+            topk_score, topk_idx = _topk_accumulate(
+                topk_score,
+                topk_idx,
+                score,
+                valid_blocks,
+                i // block_size,
+                init_blocks,
+                local_blocks,
+                BLOCKS_PER_K_BLOCK,
+                BLOCK_SIZE_T,
+            )
+        else:
+            tl.store(
+                s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
+            )
         if not DISABLE_INDEX_VALUE:
             # compute m_ij and l_ij
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -264,7 +391,25 @@ def _flash_attn_fwd_with_block_score_kernel(
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        if not FUSE_TOPK:
+            s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+    if FUSE_TOPK:
+        # The K loop covered the full causal range of this q-tile, so the running
+        # top-k is final here -- no cross-CTA reduction needed.
+        off_r = tl.arange(0, BLOCK_SIZE_Q)
+        block_start = tl.load(cu_seqblocks_q + pid_b)
+        _topk_sort_and_store(
+            topk_idx_ptr + pid_h * stride_ti_h,
+            topk_score,
+            topk_idx,
+            block_start + pid_q * BLOCK_SIZE_Q + off_r,
+            off_r + pid_q * BLOCK_SIZE_Q < q_len,
+            valid_blocks,
+            topk,
+            stride_ti_n,
+            stride_ti_t,
+            BLOCK_SIZE_T,
+        )
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
@@ -445,6 +590,7 @@ def flash_prefill_with_topk_index(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    fuse_topk: Optional[bool] = None,
 ):
     assert score_type in (
         "max",
@@ -480,16 +626,49 @@ def flash_prefill_with_topk_index(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
+    if fuse_topk is None:
+        # Off by default: the fused epilogue is correct but slower on gfx950. It
+        # deletes the 21 MiB score round trip, its -inf memset and the standalone
+        # launch, buying a ~138 us budget at chunk 8192 / context 82050. Best fused
+        # config over a 108-point BQ x BK x warps x stages sweep is 0.78x the
+        # two-kernel path, see tmp/bench_prefill_fused_topk.
+        # The epilogue itself can fit that budget -- at BQ 32 / BK 256 / w4 it costs
+        # +125 us -- but only at a config where the *base* score kernel is 933 us
+        # against its own 689 us optimum (BQ 32 / BK 256 / w8), where the epilogue
+        # instead costs +391 us. The cost is a per-candidate cross-warp argmin over
+        # BLOCK_SIZE_T plus an MFMA-slice -> blocked layout conversion, once for
+        # each of the ~640 K-blocks a q-tile scans; it scales with num_warps
+        # (+172 us at w2 vs +391 us at w8, same tile), which is exactly why it
+        # cannot be paid for -- the score kernel needs w8 to reach 689 us.
+        # Callers must opt in explicitly.
+        # block_size_q == 1 remains the correctness gate whenever they do: only
+        # then is all_seqblock_q == total_q and cu_seqblocks_q == cu_seqlens, which
+        # is what makes the fused row index block_start + pid_q * BLOCK_SIZE_Q + r
+        # valid.
+        fuse_topk = False
+    assert not fuse_topk or block_size_q == 1, "fused top-k requires block_size_q == 1"
     if disable_index_value:
         o = None
     else:
         o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
-    score = torch.full(
-        (num_heads, total_q, max_seqblock_k),
-        float("-inf"),
-        dtype=torch.float32,
+    topk_idx = torch.full(
+        (num_heads, all_seqblock_q, topk),
+        fill_value=-1,
         device=q.device,
+        dtype=torch.int32,
     )
+    if fuse_topk:
+        # SILOTIGER-790: the score kernel selects the top-k in its epilogue, so the
+        # [num_heads, total_q, max_seqblock_k] staging tensor and its ~2x HBM round
+        # trip disappear along with the standalone launch.
+        score = None
+    else:
+        score = torch.full(
+            (num_heads, total_q, max_seqblock_k),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     # launch kernel
     def grid(META):
@@ -530,22 +709,31 @@ def flash_prefill_with_topk_index(
         o.stride(0) if o is not None else 0,
         o.stride(1) if o is not None else 0,
         o.stride(2) if o is not None else 0,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
+        score.stride(0) if score is not None else 0,
+        score.stride(1) if score is not None else 0,
+        score.stride(2) if score is not None else 0,
         req_to_token.stride(0),
+        topk_idx_ptr=topk_idx,
+        cu_seqblocks_q=cu_seqblocks_q,
+        topk=topk,
+        stride_ti_h=topk_idx.stride(0),
+        stride_ti_n=topk_idx.stride(1),
+        stride_ti_t=topk_idx.stride(2),
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
         SCORE_TYPE=score_type,
         DISABLE_INDEX_VALUE=disable_index_value,
+        FUSE_TOPK=fuse_topk,
+        # Passed rather than derived by @triton.heuristics: a heuristic reading
+        # args["topk"] only sees positional args plus explicit kwargs, so it
+        # KeyErrors on any caller that invokes the kernel with the original
+        # positional argument list.
+        BLOCK_SIZE_T=triton.next_power_of_2(max(topk, 1)),
     )
+    if fuse_topk:
+        return o, topk_idx
 
     # topk extraction kernel
-    topk_idx = torch.full(
-        (num_heads, all_seqblock_q, topk),
-        fill_value=-1,
-        device=score.device,
-        dtype=torch.int32,
-    )
-    # launch kernel
     grid = (max_seqblock_q, batch_size, num_heads)
     _topk_index_kernel[grid](
         score,
