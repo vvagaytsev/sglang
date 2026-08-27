@@ -1097,6 +1097,9 @@ class Envs:
     # Both change model outputs -> accuracy-gate (GSM8K) before committing.
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q = EnvInt(0)
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K = EnvInt(0)
+    # MiniMax-M3 sparse prefill: optimized _gqa_share_sparse_fwd_kernel body --
+    # skips the causal mask where provably unneeded, and does the P.V MFMA in fp8.
+    SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
