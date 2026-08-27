@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 from ..common.utils import (
     SPARSE_KV_FP8_DTYPES,
     check_sparse_kv_fp8,
@@ -20,6 +22,121 @@ from ..common.utils import (
 # caches/pins one winning occupancy config per prefill-length bucket instead of
 # reusing one winner across all M.
 _PREFILL_M_BUCKET_THRESHOLD = 2048
+
+_FWD_OPT = bool(envs.SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT.get())
+
+# Kept separate so verification can run either mechanism on its own and price the
+# two apart; all four combinations are valid kernels. The flag is the only input,
+# so a deployment gets the stock body or both mechanisms, nothing in between.
+_SPLIT_MASK = _FWD_OPT
+_FP8_PV_787 = _FWD_OPT
+
+# P = exp2(qk - running max) in (0, 1]; lift it out of e4m3's subnormals. A power
+# of two, so exact, and p * 128 <= 128 < 240 <= e4m3 max cannot overflow.
+_FP8_PV_SCALE = 128.0
+
+
+@triton.jit
+def _sparse_block_step(
+    # carried softmax accumulators
+    m_i,
+    lse_i,
+    acc_o,
+    # this block's absolute K start (scalar)
+    c,
+    # operands and loop invariants
+    q,
+    k_cache_ptr,
+    v_cache_ptr,
+    r2t_row,
+    seq_len,
+    max_slots,
+    pid_kh,
+    q_row,
+    q_abs_min,
+    off_in_blk,
+    off_kd,
+    off_vd,
+    kd_mask,
+    vd_mask,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    sm_scale_log2e,
+    compute_dtype,
+    APPLY_MASK: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_PV: tl.constexpr,
+    PV_SCALE: tl.constexpr,
+):
+    """One selected KV block: paged gather, Q.K, online-softmax update, P.V.
+
+    APPLY_MASK is a constexpr and the caller inlines this twice rather than
+    branching inside the loop: a conditional there is nondeterministic on ~1/4 of
+    the launch configs (Triton 3.6.0 / gfx950).
+    """
+    pos = c + off_in_blk
+    pos_ok = pos < seq_len
+    slots = tl.load(r2t_row + pos, mask=pos_ok, other=0)
+    # negative-slot guard; equivalent to `% max_slots` over that guard's domain,
+    # without a 64-bit remainder (no integer divide on AMD)
+    slots = tl.where(slots < 0, slots + max_slots, slots)
+    # int64 before the stride multiply, which overflows int32 past ~16.7M slots
+    slots = slots.to(tl.int64)
+    # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+    k = tl.load(
+        k_cache_ptr
+        + slots[None, :] * stride_ks
+        + pid_kh * stride_kh
+        + off_kd[:, None] * stride_kd,
+        mask=kd_mask[:, None] & pos_ok[None, :],
+        other=0.0,
+    )
+    if IS_FP8:
+        # fp8 main K cache is unit-scaled; widen to the Q compute dtype before
+        # the tl.dot (compiled out when the cache is bf16). Q.K is deliberately
+        # not done in fp8 -- see SILOTIGER-787 for why.
+        k = k.to(compute_dtype)
+    # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+    #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
+    qk = tl.dot(q, k) * sm_scale_log2e
+    if APPLY_MASK:
+        # keep column <=> q_abs >= pos, rearranged onto 1D operands so no mask
+        # tensor is materialized. Subsumes the pos < seq_len boundary mask.
+        col_lim = off_in_blk + (c - q_abs_min)
+        qk = tl.where(q_row[:, None] >= col_lim[None, :], qk, float("-inf"))
+    # compute m_ij and l_ij
+    m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+    p = tl.exp2(qk - m_ij[:, None])
+    l_ij = tl.sum(p, axis=1)
+    # scale acc_o
+    acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+    # paged load V
+    v = tl.load(
+        v_cache_ptr
+        + slots[:, None] * stride_vs
+        + pid_kh * stride_vh
+        + off_vd[None, :] * stride_vd,
+        mask=pos_ok[:, None] & vd_mask[None, :],
+        other=0.0,
+    )
+    if IS_FP8 and FP8_PV:
+        # two fp8 MFMA operands instead of widening both: ~2x the rate on gfx950,
+        # and accuracy-affecting, hence behind the flag
+        p = (p * PV_SCALE).to(v.dtype)
+    else:
+        if IS_FP8:
+            # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather than
+            # to fp8 (which would wreck attention-weight precision).
+            v = v.to(compute_dtype)
+        p = p.to(v.dtype)
+    acc_o += tl.dot(p, v)
+    # update statistics
+    lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+    return m_ij, lse_i, acc_o
 
 
 @triton.heuristics(
@@ -121,9 +238,11 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    SPLIT_MASK: tl.constexpr,
     FP8_PV: tl.constexpr,
     FP8_QK: tl.constexpr,
     Q_IS_FP8: tl.constexpr,
+    PV_SCALE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # bf16/fp16 compute dtype for internal casts (e.g. widening the fp8 K/V
@@ -166,6 +285,9 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
+    r2t_row = req_to_token_ptr + sid * stride_r2t_b
+    # flat accumulator row -> query index in the tile (q-major after the reshape)
+    q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
@@ -186,13 +308,8 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        # init statistics
-        off_q_k = (
-            tl.arange(0, BLOCK_SIZE_Q)[:, None]
-            + pid_q_j * BLOCK_SIZE_Q
-            + prefix_len
-            - tl.arange(0, BLOCK_SIZE_K)[None, :]
-        )
+        # smallest absolute query position in this tile (SILOTIGER-787 split-mask path)
+        q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
         if HAS_SINK:
             m_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
             lse_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
@@ -229,86 +346,183 @@ def _gqa_share_sparse_fwd_kernel(
             qk_scale = sm_scale_log2e / q_scale
         else:
             q_qk = q
-        # sparse attention
-        for i in range(real_topk):
-            # get current block start index (absolute K position)
-            c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
-            t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_ks
-                + pid_kh * stride_kh
-                + off_kd[:, None] * stride_kd,
-                mask=kd_mask[:, None] & pos_mask[None, :],
-                other=0.0,
+        # SPLIT_MASK is a constexpr, so only the taken branch is emitted. Keep the
+        # branches separate rather than sharing one loop: emitting both bodies
+        # costs ~4% even when one never runs, and flag-off must stay free.
+        if SPLIT_MASK:
+            # length of the leading run of blocks that provably need no causal
+            # mask; padding (-1) counts as needing one, which ends the run
+            needs_mask = (
+                (topk_idx < 0) | (topk_idx * BLOCK_SIZE_K > q_abs_min - BLOCK_SIZE_K + 1)
+            ).to(tl.int32)
+            n_pre = tl.sum((tl.cumsum(needs_mask, axis=0) == 0).to(tl.int32), axis=0)
+            n_pre = min(n_pre, real_topk)
+            for i in range(n_pre):
+                c = tl.load(t_ptr_j + i * stride_tk).to(tl.int32) * BLOCK_SIZE_K
+                m_i, lse_i, acc_o = _sparse_block_step(
+                    m_i,
+                    lse_i,
+                    acc_o,
+                    c,
+                    q,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    r2t_row,
+                    seq_len,
+                    max_slots,
+                    pid_kh,
+                    q_row,
+                    q_abs_min,
+                    off_n,
+                    off_kd,
+                    off_vd,
+                    kd_mask,
+                    vd_mask,
+                    stride_ks,
+                    stride_kh,
+                    stride_kd,
+                    stride_vs,
+                    stride_vh,
+                    stride_vd,
+                    sm_scale_log2e,
+                    compute_dtype,
+                    APPLY_MASK=False,
+                    IS_FP8=IS_FP8,
+                    FP8_PV=FP8_PV,
+                    PV_SCALE=PV_SCALE,
+                )
+            # Required: without it, LDS scratch is reused across the two loops and
+            # output goes nondeterministic on 2 of the 36 launch configs. Both trip
+            # counts are workgroup-uniform, so it cannot deadlock.
+            tl.debug_barrier()
+            for i in range(n_pre, real_topk):
+                c = tl.load(t_ptr_j + i * stride_tk).to(tl.int32) * BLOCK_SIZE_K
+                m_i, lse_i, acc_o = _sparse_block_step(
+                    m_i,
+                    lse_i,
+                    acc_o,
+                    c,
+                    q,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    r2t_row,
+                    seq_len,
+                    max_slots,
+                    pid_kh,
+                    q_row,
+                    q_abs_min,
+                    off_n,
+                    off_kd,
+                    off_vd,
+                    kd_mask,
+                    vd_mask,
+                    stride_ks,
+                    stride_kh,
+                    stride_kd,
+                    stride_vs,
+                    stride_vh,
+                    stride_vd,
+                    sm_scale_log2e,
+                    compute_dtype,
+                    APPLY_MASK=True,
+                    IS_FP8=IS_FP8,
+                    FP8_PV=FP8_PV,
+                    PV_SCALE=PV_SCALE,
+                )
+        else:
+            # The stock loop, kept as-is apart from hoisted index arithmetic -- do
+            # not refactor into the block step above. It folds the mask into the
+            # MFMA accumulator, which the block step cannot, and rebuilding it from
+            # there costs ~5%.
+            off_q_k = (
+                tl.arange(0, BLOCK_SIZE_Q)[:, None]
+                + pid_q_j * BLOCK_SIZE_Q
+                + prefix_len
+                - tl.arange(0, BLOCK_SIZE_K)[None, :]
             )
-            if IS_FP8:
-                if Q_IS_FP8:
-                    # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
-                    pass
-                elif FP8_QK:
-                    # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
-                    pass
+            # sparse attention
+            for i in range(real_topk):
+                # get current block start index (absolute K position)
+                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                t_ptr_j = t_ptr_j + stride_tk
+                # paged load K via req_to_token: pos -> slot -> k_cache
+                pos = c + off_n
+                pos_mask = pos < seq_len
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+                # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_ks
+                    + pid_kh * stride_kh
+                    + off_kd[:, None] * stride_kd,
+                    mask=kd_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    if Q_IS_FP8:
+                        # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
+                        pass
+                    elif FP8_QK:
+                        # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
+                        pass
+                    else:
+                        # fp8 main K cache is unit-scaled; widen to the compute dtype
+                        # before the tl.dot (compiled out when the cache is bf16).
+                        k = k.to(compute_dtype)
+                # compute qk
+                qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+                # causal mask
+                qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
+                qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+                # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+                #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]. qk_scale folds the FP8_QK
+                # Q-scale inverse into sm_scale (== sm_scale_log2e when FP8_QK is off).
+                qk += tl.dot(q_qk, k) * qk_scale
+                # K boundary mask: positions beyond seq_len contribute -inf
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+                # paged load V
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vs
+                    + pid_kh * stride_vh
+                    + off_vd[None, :] * stride_vd,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    if FP8_PV:
+                        # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
+                        pass
+                    else:
+                        # Widen V so `p.to(v.dtype)` casts P to the compute dtype
+                        # rather than fp8 (which would wreck attn-weight precision).
+                        v = v.to(compute_dtype)
+                # online softmax: running max + per-tile acc_o rescale.
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                if FP8_PV and IS_FP8:
+                    # cast P to fp8 for the P@V MFMA (V kept fp8 above). P in [0, 1]
+                    # here, so the clamp only guards a stray rounding overflow.
+                    p_cast = tl.minimum(p, 448.0).to(v.dtype)
                 else:
-                    # fp8 main K cache is unit-scaled; widen to the compute dtype
-                    # before the tl.dot (compiled out when the cache is bf16).
-                    k = k.to(compute_dtype)
-            # compute qk
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal mask
-            qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]. qk_scale folds the FP8_QK
-            # Q-scale inverse into sm_scale (== sm_scale_log2e when FP8_QK is off).
-            qk += tl.dot(q_qk, k) * qk_scale
-            # K boundary mask: positions beyond seq_len contribute -inf
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vs
-                + pid_kh * stride_vh
-                + off_vd[None, :] * stride_vd,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                if FP8_PV:
-                    # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
-                    pass
-                else:
-                    # Widen V so `p.to(v.dtype)` casts P to the compute dtype
-                    # rather than fp8 (which would wreck attn-weight precision).
-                    v = v.to(compute_dtype)
-            # online softmax: running max + per-tile acc_o rescale.
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            if FP8_PV and IS_FP8:
-                # cast P to fp8 for the P@V MFMA (V kept fp8 above). P in [0, 1]
-                # here, so the clamp only guards a stray rounding overflow.
-                p_cast = tl.minimum(p, 448.0).to(v.dtype)
-            else:
-                p_cast = p.to(v.dtype)
-            acc_o += tl.dot(p_cast, v)
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        # final scale
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+                    p_cast = p.to(v.dtype)
+                acc_o += tl.dot(p_cast, v)
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        # final scale; also undoes PV_SCALE for the SILOTIGER-787 split-mask path
+        if SPLIT_MASK and IS_FP8 and FP8_PV:
+            acc_o = acc_o * (tl.exp2(m_i - lse_i) * (1.0 / PV_SCALE))[:, None]
+        else:
+            acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_VD)
         o_ptrs = tl.make_block_ptr(
@@ -390,6 +604,9 @@ def flash_prefill_with_gqa_share_sparse(
     # Both are no-ops unless the KV cache is fp8.
     fp8_pv = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_PV", "1") == "1"
     fp8_qk = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_QK", "1") == "1"
+    # SILOTIGER-787: flag-on compiles the split-mask + fp8 P.V body; flag-off keeps
+    # the stock loop and the SILOTIGER-762 fp8 P.V / fp8 Q.K toggles above.
+    kernel_fp8_pv = _FP8_PV_787 if _FWD_OPT else fp8_pv
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
@@ -439,8 +656,10 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
-        FP8_PV=fp8_pv,
+        SPLIT_MASK=_SPLIT_MASK,
+        FP8_PV=kernel_fp8_pv,
         FP8_QK=fp8_qk,
         Q_IS_FP8=q_is_fp8,
+        PV_SCALE=_FP8_PV_SCALE,
     )
     return o
