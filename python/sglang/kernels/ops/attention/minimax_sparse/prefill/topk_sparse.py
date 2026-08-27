@@ -29,7 +29,7 @@ _FWD_OPT = bool(envs.SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT.get())
 # two apart; all four combinations are valid kernels. The flag is the only input,
 # so a deployment gets the stock body or both mechanisms, nothing in between.
 _SPLIT_MASK = _FWD_OPT
-_FP8_PV_787 = _FWD_OPT
+_FP8_PV = _FWD_OPT
 
 # P = exp2(qk - running max) in (0, 1]; lift it out of e4m3's subnormals. A power
 # of two, so exact, and p * 128 <= 128 < 240 <= e4m3 max cannot overflow.
@@ -604,9 +604,9 @@ def flash_prefill_with_gqa_share_sparse(
     # Both are no-ops unless the KV cache is fp8.
     fp8_pv = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_PV", "1") == "1"
     fp8_qk = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_QK", "1") == "1"
-    # SILOTIGER-787: flag-on compiles the split-mask + fp8 P.V body; flag-off keeps
-    # the stock loop and the SILOTIGER-762 fp8 P.V / fp8 Q.K toggles above.
-    kernel_fp8_pv = _FP8_PV_787 if _FWD_OPT else fp8_pv
+    # Split-mask path uses module _FP8_PV (microbench may override).
+    # Stock path: 762 env unless ablation sets _FP8_PV alone (PV_ONLY).
+    kernel_fp8_pv = _FP8_PV if _SPLIT_MASK else (_FP8_PV or fp8_pv)
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
