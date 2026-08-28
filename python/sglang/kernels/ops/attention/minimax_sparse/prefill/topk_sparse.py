@@ -45,7 +45,7 @@ def _sparse_block_step(
     # this block's absolute K start (scalar)
     c,
     # operands and loop invariants
-    q,
+    q_qk,
     k_cache_ptr,
     v_cache_ptr,
     r2t_row,
@@ -65,11 +65,13 @@ def _sparse_block_step(
     stride_vs,
     stride_vh,
     stride_vd,
-    sm_scale_log2e,
+    qk_scale,
     compute_dtype,
     APPLY_MASK: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_PV: tl.constexpr,
+    FP8_QK: tl.constexpr,
+    Q_IS_FP8: tl.constexpr,
     PV_SCALE: tl.constexpr,
 ):
     """One selected KV block: paged gather, Q.K, online-softmax update, P.V.
@@ -96,13 +98,19 @@ def _sparse_block_step(
         other=0.0,
     )
     if IS_FP8:
-        # fp8 main K cache is unit-scaled; widen to the Q compute dtype before
-        # the tl.dot (compiled out when the cache is bf16). Q.K is deliberately
-        # not done in fp8 -- see SILOTIGER-787 for why.
-        k = k.to(compute_dtype)
+        if Q_IS_FP8:
+            # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
+            pass
+        elif FP8_QK:
+            # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
+            pass
+        else:
+            # fp8 main K cache is unit-scaled; widen to the Q compute dtype
+            # before the tl.dot (compiled out when the cache is bf16).
+            k = k.to(compute_dtype)
     # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
     #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-    qk = tl.dot(q, k) * sm_scale_log2e
+    qk = tl.dot(q_qk, k) * qk_scale
     if APPLY_MASK:
         # keep column <=> q_abs >= pos, rearranged onto 1D operands so no mask
         # tensor is materialized. Subsumes the pos < seq_len boundary mask.
@@ -123,15 +131,18 @@ def _sparse_block_step(
         mask=pos_ok[:, None] & vd_mask[None, :],
         other=0.0,
     )
-    if IS_FP8 and FP8_PV:
-        # two fp8 MFMA operands instead of widening both: ~2x the rate on gfx950,
-        # and accuracy-affecting, hence behind the flag
-        p = (p * PV_SCALE).to(v.dtype)
-    else:
-        if IS_FP8:
+    if IS_FP8:
+        if FP8_PV:
+            # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
+            pass
+        else:
             # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather than
             # to fp8 (which would wreck attention-weight precision).
             v = v.to(compute_dtype)
+    if IS_FP8 and FP8_PV:
+        # Match SILOTIGER-762 stock: clamp P before the fp8 cast (V kept fp8 above).
+        p = tl.minimum(p, 448.0).to(v.dtype)
+    else:
         p = p.to(v.dtype)
     acc_o += tl.dot(p, v)
     # update statistics
@@ -308,7 +319,7 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        # smallest absolute query position in this tile (SILOTIGER-787 split-mask path)
+        # smallest absolute query position in this tile (split-mask path)
         q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
         if HAS_SINK:
             m_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
@@ -364,7 +375,7 @@ def _gqa_share_sparse_fwd_kernel(
                     lse_i,
                     acc_o,
                     c,
-                    q,
+                    q_qk,
                     k_cache_ptr,
                     v_cache_ptr,
                     r2t_row,
@@ -384,11 +395,13 @@ def _gqa_share_sparse_fwd_kernel(
                     stride_vs,
                     stride_vh,
                     stride_vd,
-                    sm_scale_log2e,
+                    qk_scale,
                     compute_dtype,
                     APPLY_MASK=False,
                     IS_FP8=IS_FP8,
                     FP8_PV=FP8_PV,
+                    FP8_QK=FP8_QK,
+                    Q_IS_FP8=Q_IS_FP8,
                     PV_SCALE=PV_SCALE,
                 )
             # Required: without it, LDS scratch is reused across the two loops and
@@ -402,7 +415,7 @@ def _gqa_share_sparse_fwd_kernel(
                     lse_i,
                     acc_o,
                     c,
-                    q,
+                    q_qk,
                     k_cache_ptr,
                     v_cache_ptr,
                     r2t_row,
@@ -422,11 +435,13 @@ def _gqa_share_sparse_fwd_kernel(
                     stride_vs,
                     stride_vh,
                     stride_vd,
-                    sm_scale_log2e,
+                    qk_scale,
                     compute_dtype,
                     APPLY_MASK=True,
                     IS_FP8=IS_FP8,
                     FP8_PV=FP8_PV,
+                    FP8_QK=FP8_QK,
+                    Q_IS_FP8=Q_IS_FP8,
                     PV_SCALE=PV_SCALE,
                 )
         else:
@@ -518,11 +533,8 @@ def _gqa_share_sparse_fwd_kernel(
                 # update statistics
                 m_i = m_ij
                 lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        # final scale; also undoes PV_SCALE for the SILOTIGER-787 split-mask path
-        if SPLIT_MASK and IS_FP8 and FP8_PV:
-            acc_o = acc_o * (tl.exp2(m_i - lse_i) * (1.0 / PV_SCALE))[:, None]
-        else:
-            acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+        # final scale
+        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_VD)
         o_ptrs = tl.make_block_ptr(
