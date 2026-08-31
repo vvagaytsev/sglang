@@ -25,16 +25,6 @@ _PREFILL_M_BUCKET_THRESHOLD = 2048
 
 _FWD_OPT = bool(envs.SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT.get())
 
-# SILOTIGER-787: flag-on runs the split-mask prefill body via _sparse_block_step.
-# Flag-off keeps the baseline always-masked loop (762 fp8 Q·K/P·V unchanged).
-# _SPLIT_MASK / _FP8_PV mirror the flag for microbench ablation only.
-_SPLIT_MASK = _FWD_OPT
-_FP8_PV = _FWD_OPT
-
-# P = exp2(qk - running max) in (0, 1]; lift it out of e4m3's subnormals. A power
-# of two, so exact, and p * 128 <= 128 < 240 <= e4m3 max cannot overflow.
-_FP8_PV_SCALE = 128.0
-
 
 @triton.jit
 def _sparse_block_step(
@@ -72,13 +62,12 @@ def _sparse_block_step(
     FP8_PV: tl.constexpr,
     FP8_QK: tl.constexpr,
     Q_IS_FP8: tl.constexpr,
-    PV_SCALE: tl.constexpr,
 ):
-    """One selected KV block: paged gather, Q.K, online-softmax update, P.V.
+    """One top-k KV block: paged gather, Q@K, online softmax, P@V.
 
-    APPLY_MASK is a constexpr and the caller inlines this twice rather than
-    branching inside the loop: a conditional there is nondeterministic on ~1/4 of
-    the launch configs (Triton 3.6.0 / gfx950).
+    APPLY_MASK: when True, apply causal masking on qk; when False, only the
+    seq_len boundary (pos < seq_len). The caller instantiates this twice per
+    tile — unmasked prefix, then masked tail — rather than branching at runtime.
     """
     pos = c + off_in_blk
     pos_ok = pos < seq_len
@@ -97,25 +86,19 @@ def _sparse_block_step(
         mask=kd_mask[:, None] & pos_ok[None, :],
         other=0.0,
     )
-    if IS_FP8:
-        if Q_IS_FP8:
-            # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
-            pass
-        elif FP8_QK:
-            # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
-            pass
-        else:
-            # fp8 main K cache is unit-scaled; widen to the Q compute dtype
-            # before the tl.dot (compiled out when the cache is bf16).
-            k = k.to(compute_dtype)
+    # fp8 K stays narrow for native / in-kernel fp8 Q@K; otherwise widen before tl.dot
+    # (compiled out when the cache is bf16).
+    if IS_FP8 and not Q_IS_FP8 and not FP8_QK:
+        k = k.to(compute_dtype)
     # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
     #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
     qk = tl.dot(q_qk, k) * qk_scale
     if APPLY_MASK:
-        # keep column <=> q_abs >= pos, rearranged onto 1D operands so no mask
-        # tensor is materialized. Subsumes the pos < seq_len boundary mask.
+        # Causal: column k is valid iff q_abs >= pos (= c + off_in_blk).
         col_lim = off_in_blk + (c - q_abs_min)
         qk = tl.where(q_row[:, None] >= col_lim[None, :], qk, float("-inf"))
+    # K-length boundary (pos < seq_len): masked loads zero K, not -inf qk — match baseline.
+    qk = tl.where(pos_ok[None, :], qk, float("-inf"))
     # compute m_ij and l_ij
     m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
     p = tl.exp2(qk - m_ij[:, None])
@@ -131,14 +114,9 @@ def _sparse_block_step(
         mask=pos_ok[:, None] & vd_mask[None, :],
         other=0.0,
     )
-    if IS_FP8:
-        if FP8_PV:
-            # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
-            pass
-        else:
-            # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather than
-            # to fp8 (which would wreck attention-weight precision).
-            v = v.to(compute_dtype)
+    # fp8 V stays narrow for fp8 P@V; otherwise widen so P casts to compute dtype.
+    if IS_FP8 and not FP8_PV:
+        v = v.to(compute_dtype)
     if IS_FP8 and FP8_PV:
         # Match SILOTIGER-762 baseline: clamp P before the fp8 cast (V kept fp8 above).
         p = tl.minimum(p, 448.0).to(v.dtype)
@@ -253,7 +231,6 @@ def _gqa_share_sparse_fwd_kernel(
     FP8_PV: tl.constexpr,
     FP8_QK: tl.constexpr,
     Q_IS_FP8: tl.constexpr,
-    PV_SCALE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # bf16/fp16 compute dtype for internal casts (e.g. widening the fp8 K/V
@@ -296,9 +273,6 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
-    r2t_row = req_to_token_ptr + sid * stride_r2t_b
-    # flat accumulator row -> query index in the tile (q-major after the reshape)
-    q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
@@ -319,8 +293,6 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        # smallest absolute query position in this tile (split-mask path)
-        q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
         if HAS_SINK:
             m_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
             lse_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
@@ -357,10 +329,13 @@ def _gqa_share_sparse_fwd_kernel(
             qk_scale = sm_scale_log2e / q_scale
         else:
             q_qk = q
-        # SPLIT_MASK is a constexpr, so only the taken branch is emitted. Keep the
-        # branches separate rather than sharing one loop: emitting both bodies
-        # costs ~4% even when one never runs, and flag-off must stay free.
+        # split-mask opt vs always-masked baseline.
         if SPLIT_MASK:
+            r2t_row = req_to_token_ptr + sid * stride_r2t_b
+            # flat accumulator row -> query index in the tile (q-major after reshape)
+            q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
+            # smallest absolute query position in this tile
+            q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
             # length of the leading run of blocks that provably need no causal
             # mask; padding (-1) counts as needing one, which ends the run
             needs_mask = (
@@ -402,11 +377,10 @@ def _gqa_share_sparse_fwd_kernel(
                     FP8_PV=FP8_PV,
                     FP8_QK=FP8_QK,
                     Q_IS_FP8=Q_IS_FP8,
-                    PV_SCALE=PV_SCALE,
                 )
-            # Required: without it, LDS scratch is reused across the two loops and
-            # output goes nondeterministic on 2 of the 36 launch configs. Both trip
-            # counts are workgroup-uniform, so it cannot deadlock.
+            # Sync prefix → masked tail: without it, LDS scratch from the first loop is
+            # reused too early and output is nondeterministic on some gfx950 autotune configs.
+            # n_pre and real_topk are workgroup-uniform, so the barrier cannot deadlock.
             tl.debug_barrier()
             for i in range(n_pre, real_topk):
                 c = tl.load(t_ptr_j + i * stride_tk).to(tl.int32) * BLOCK_SIZE_K
@@ -442,13 +416,9 @@ def _gqa_share_sparse_fwd_kernel(
                     FP8_PV=FP8_PV,
                     FP8_QK=FP8_QK,
                     Q_IS_FP8=Q_IS_FP8,
-                    PV_SCALE=PV_SCALE,
                 )
         else:
-            # Baseline always-masked loop (762 fp8 Q·K/P·V); hoisted index arithmetic
-            # only — do not refactor into _sparse_block_step. It folds the mask into
-            # the MFMA accumulator, which the block step cannot, and rebuilding it
-            # from there costs ~5%.
+            # causal mask is folded into the qk accumulator before tl.dot.
             off_q_k = (
                 tl.arange(0, BLOCK_SIZE_Q)[:, None]
                 + pid_q_j * BLOCK_SIZE_Q
@@ -616,9 +586,6 @@ def flash_prefill_with_gqa_share_sparse(
     # Both are no-ops unless the KV cache is fp8.
     fp8_pv = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_PV", "1") == "1"
     fp8_qk = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_QK", "1") == "1"
-    # Split-mask path: _FP8_PV tracks _SPLIT_MASK (microbench ablation only).
-    # Baseline path: 762 env flags (SGLANG_MINIMAX_SPARSE_FP8_{PV,QK}).
-    kernel_fp8_pv = _FP8_PV if _SPLIT_MASK else (_FP8_PV or fp8_pv)
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
@@ -668,10 +635,9 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
-        SPLIT_MASK=_SPLIT_MASK,
-        FP8_PV=kernel_fp8_pv,
+        SPLIT_MASK=_FWD_OPT,
+        FP8_PV=fp8_pv,
         FP8_QK=fp8_qk,
         Q_IS_FP8=q_is_fp8,
-        PV_SCALE=_FP8_PV_SCALE,
     )
     return o
