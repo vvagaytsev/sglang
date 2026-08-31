@@ -97,8 +97,6 @@ def _sparse_block_step(
         # Causal: column k is valid iff q_abs >= pos (= c + off_in_blk).
         col_lim = off_in_blk + (c - q_abs_min)
         qk = tl.where(q_row[:, None] >= col_lim[None, :], qk, float("-inf"))
-    # K-length boundary (pos < seq_len): masked loads zero K, not -inf qk — match baseline.
-    qk = tl.where(pos_ok[None, :], qk, float("-inf"))
     # compute m_ij and l_ij
     m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
     p = tl.exp2(qk - m_ij[:, None])
@@ -273,12 +271,16 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    if SPLIT_MASK:
+        r2t_row = req_to_token_ptr + sid * stride_r2t_b
+        # flat accumulator row -> query index in the tile (q-major after reshape)
+        q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
         # we assume that the topk_idx is right padded with -1
-        off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         valid_idx = tl.where(topk_idx >= 0, off_t, -1)
         real_topk = tl.sum(valid_idx != -1, axis=0)
@@ -331,9 +333,6 @@ def _gqa_share_sparse_fwd_kernel(
             q_qk = q
         # split-mask opt vs always-masked baseline.
         if SPLIT_MASK:
-            r2t_row = req_to_token_ptr + sid * stride_r2t_b
-            # flat accumulator row -> query index in the tile (q-major after reshape)
-            q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
             # smallest absolute query position in this tile
             q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
             # length of the leading run of blocks that provably need no causal
