@@ -25,9 +25,9 @@ _PREFILL_M_BUCKET_THRESHOLD = 2048
 
 _FWD_OPT = bool(envs.SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT.get())
 
-# Kept separate so verification can run either mechanism on its own and price the
-# two apart; all four combinations are valid kernels. The flag is the only input,
-# so a deployment gets the stock body or both mechanisms, nothing in between.
+# SILOTIGER-787: flag-on runs the split-mask prefill body via _sparse_block_step.
+# Flag-off keeps the baseline always-masked loop (762 fp8 Q·K/P·V unchanged).
+# _SPLIT_MASK / _FP8_PV mirror the flag for microbench ablation only.
 _SPLIT_MASK = _FWD_OPT
 _FP8_PV = _FWD_OPT
 
@@ -140,7 +140,7 @@ def _sparse_block_step(
             # to fp8 (which would wreck attention-weight precision).
             v = v.to(compute_dtype)
     if IS_FP8 and FP8_PV:
-        # Match SILOTIGER-762 stock: clamp P before the fp8 cast (V kept fp8 above).
+        # Match SILOTIGER-762 baseline: clamp P before the fp8 cast (V kept fp8 above).
         p = tl.minimum(p, 448.0).to(v.dtype)
     else:
         p = p.to(v.dtype)
@@ -445,10 +445,10 @@ def _gqa_share_sparse_fwd_kernel(
                     PV_SCALE=PV_SCALE,
                 )
         else:
-            # The stock loop, kept as-is apart from hoisted index arithmetic -- do
-            # not refactor into the block step above. It folds the mask into the
-            # MFMA accumulator, which the block step cannot, and rebuilding it from
-            # there costs ~5%.
+            # Baseline always-masked loop (762 fp8 Q·K/P·V); hoisted index arithmetic
+            # only — do not refactor into _sparse_block_step. It folds the mask into
+            # the MFMA accumulator, which the block step cannot, and rebuilding it
+            # from there costs ~5%.
             off_q_k = (
                 tl.arange(0, BLOCK_SIZE_Q)[:, None]
                 + pid_q_j * BLOCK_SIZE_Q
@@ -616,8 +616,8 @@ def flash_prefill_with_gqa_share_sparse(
     # Both are no-ops unless the KV cache is fp8.
     fp8_pv = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_PV", "1") == "1"
     fp8_qk = os.environ.get("SGLANG_MINIMAX_SPARSE_FP8_QK", "1") == "1"
-    # Split-mask path uses module _FP8_PV (microbench may override).
-    # Stock path: 762 env unless ablation sets _FP8_PV alone (PV_ONLY).
+    # Split-mask path: _FP8_PV tracks _SPLIT_MASK (microbench ablation only).
+    # Baseline path: 762 env flags (SGLANG_MINIMAX_SPARSE_FP8_{PV,QK}).
     kernel_fp8_pv = _FP8_PV if _SPLIT_MASK else (_FP8_PV or fp8_pv)
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
