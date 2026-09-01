@@ -558,6 +558,7 @@ def _topk_index_kernel(
     cu_seqlens,
     cu_seqblocks_q,
     prefix_lens,
+    batch_size,
     # shape
     topk,  # not constexpr to avoid recompilation when topk changes
     init_blocks: tl.constexpr,
@@ -578,17 +579,26 @@ def _topk_index_kernel(
     tl.static_assert(
         BLOCK_SIZE_K > BLOCK_SIZE_T
     )  # use BLOCK_SIZE_T instead of topk (stricter but safe)
-    # get batch id and head id
-    pid_q = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_h = tl.program_id(2)
+    pid_q_global, pid_h = tl.program_id(0), tl.program_id(1)
+
+    # Map the flat q-block id to (batch, block-within-batch), the same way the
+    # score kernel does -- except cu_seqblocks_q is already that prefix sum, so
+    # the scan only has to count how many batches end at or before this id. Dim 0
+    # was (max q-blocks) replicated over a batch dimension, which sized every
+    # sequence by the longest one: a [8060, 1 x 14] batch launched 8060 blocks
+    # fifteen times and had fourteen of those runs return here immediately.
+    # Branchless because Triton has no `break`, and the trip count is the batch.
+    pid_b = 0
+    for b in tl.range(0, batch_size):
+        pid_b += tl.where(pid_q_global >= tl.load(cu_seqblocks_q + b + 1), 1, 0)
+    # all_seqblock_q is exact, so this only fires if a caller rounds the grid up.
+    if pid_b >= batch_size:
+        return
+    block_start = tl.load(cu_seqblocks_q + pid_b)
+    pid_q = pid_q_global - block_start
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
-    block_start = tl.load(cu_seqblocks_q + pid_b)
-    block_num = tl.load(cu_seqblocks_q + pid_b + 1) - block_start
     prefix_len = tl.load(prefix_lens + pid_b)
-    if pid_q >= block_num:
-        return
     # offsets
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_t = tl.arange(0, BLOCK_SIZE_T)
@@ -660,11 +670,10 @@ def _topk_index_kernel(
         axis=0,
     )
     # save topk
+    # block_start + pid_q is pid_q_global by construction: the flat id already
+    # indexes topk_idx's [all_seqblock_q] row dimension.
     ti_ptrs = (
-        ti_ptr
-        + (block_start + pid_q) * stride_ti_n
-        + pid_h * stride_ti_h
-        + off_t * stride_ti_t
+        ti_ptr + pid_q_global * stride_ti_n + pid_h * stride_ti_h + off_t * stride_ti_t
     )
     topk_mask = tl.arange(0, BLOCK_SIZE_T) < min(topk, valid_blocks)
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=topk_mask)
@@ -726,8 +735,11 @@ def flash_prefill_with_topk_index(
     ), "init_blocks + local_blocks must be less than topk"
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
-        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+    # max_seqblock_q is accepted for call compatibility but no longer read: it
+    # sized the old dense top-k grid, which the flat q-block grid replaced.
+    del max_seqblock_q
+    if cu_seqblocks_q is None or all_seqblock_q is None:
+        cu_seqblocks_q, _, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
@@ -849,8 +861,11 @@ def flash_prefill_with_topk_index(
     if fuse_topk:
         return o, topk_idx
 
-    # topk extraction kernel
-    grid = (max_seqblock_q, batch_size, num_heads)
+    # topk extraction kernel. Same flat q-block grid as the score kernel above:
+    # one workgroup per real q-block per head, rather than max_seqblock_q blocks
+    # for every sequence in the batch regardless of its length. all_seqblock_q is
+    # the exact sum, so unlike the score grid this one needs no batch-1 slack.
+    grid = (all_seqblock_q, num_heads)
     _topk_index_kernel[grid](
         score,
         topk_idx,
@@ -859,6 +874,7 @@ def flash_prefill_with_topk_index(
         cu_seqlens,
         cu_seqblocks_q,
         prefix_lens,
+        batch_size,
         topk,
         init_blocks,
         local_blocks,
