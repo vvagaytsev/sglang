@@ -9,13 +9,23 @@ import triton.language as tl
 from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 
 # Score-only path (DISABLE_INDEX_VALUE=True), i.e. every sparse layer of MiniMax-M3.
-# BLOCK_SIZE_Q=64 halves the workgroup count vs BLOCK_SIZE_Q=32, keeping a
-# chunked-prefill-8192 step at ~128 workgroups instead of ~256. That matters because
-# BLOCK_SIZE_K=256 costs 132 KB of the 160 KB LDS/CU, so only one workgroup is
-# resident per CU: crossing 256 active workgroups serializes into a second wave and
-# ~1.9x the latency, with no partial-occupancy cushion.
+#
+# Occupancy, not tile size, decides this one. The limit is VGPRs rather than LDS:
+# BLOCK_SIZE_K=256 costs ~65 KB of the 160 KB LDS/CU, so LDS would allow 2
+# workgroups per CU either way, but num_warps=8 puts 2 waves on each SIMD and at
+# 218 VGPRs only 2 such waves fit in the 512-VGPR file -- 1 workgroup per CU.
+# num_warps=4 puts 1 wave per SIMD, so even at 254 VGPRs the CU holds 2
+# workgroups. That cushion is what matters: at 1 wg/CU, crossing 256 active
+# workgroups serializes into a second wave for ~1.9x the latency, and a
+# chunked-prefill-8192 step sits right on that edge.
+#
+# Measured on gfx950 (MI355X, 256 CU) over the production shape mix at both
+# num_heads=1 and num_heads=16, vs the previous 64x256 w8 s2: 1.08-1.19x total,
+# no shape slower. num_stages=3 over 2 is worth a further ~1.2x here. The CDNA
+# launch knobs (waves_per_eu, matrix_instr_nonkdim) were swept on top of this and
+# moved nothing outside noise, so they are deliberately not set.
 _SCORE_ONLY_CONFIG = triton.Config(
-    {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2
+    {"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_K": 256}, num_warps=4, num_stages=3
 )
 
 # DISABLE_INDEX_VALUE=False also stages a V tile, and BLOCK_SIZE_K=256 then needs
