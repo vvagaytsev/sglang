@@ -34,24 +34,71 @@ _WITH_INDEX_VALUE_CONFIG = triton.Config(
 )
 
 
+# The two BLOCK_SIZE_Q the score path chooses between, and the workgroups of each
+# that gfx950's 256 CUs hold at once. At BLOCK_SIZE_K=256 / num_warps=4 the 32-row
+# tile fits two per CU and the 128-row tile one, so the small tile has twice the
+# machine's worth of slots.
+_SCORE_SMALL_TILE = 32
+_SCORE_LARGE_TILE = 128
+_SCORE_SMALL_TILE_WAVE = 512
+_SCORE_LARGE_TILE_WAVE = 256
+
+# What one wave of 128-row tiles costs in units of a full 32-row launch. A wave of
+# each measures 1113 ns against 785 ns on gfx950, i.e. 1.42, but that overstates
+# the large tile's disadvantage: its waves are the ceiling of a step function, so
+# a partly-filled last wave is charged as a whole one while the small tile's
+# estimate stays exact. Fitting the crossover over the shapes below puts the
+# effective ratio at 1.25, and the optimum is flat -- anything in 1.1..1.35 gets
+# at most four more of the 114 shapes wrong.
+_SCORE_LARGE_TILE_WAVE_COST = 1.25
+
+
 def _score_block_size_q(args):
-    """Pick BLOCK_SIZE_Q from num_heads, which no autotune config can dispatch on.
+    """Pick BLOCK_SIZE_Q from the launch shape, which no autotune config can see.
 
-    The grid is one workgroup per q-tile per head, so num_heads scales the launch
-    without changing any constexpr the autotune key can see. That matters because
-    the score kernel is residency-bound: on 256 CUs a 128-row tile only pays off
-    once there are enough workgroups to fill the machine, and num_heads is the
-    factor that decides whether a given token count gets there.
+    The autotune key holds only dtypes and layout constexprs, so a Config cannot
+    dispatch on token or head count. Both decide this one, via occupancy: the
+    grid is a workgroup per q-tile per head, and the two tile sizes retire those
+    workgroups differently. Measured on gfx950 at bs=1, the 128-row tile steps
+    1128 -> 2222 -> 3336 -> 4443 ns as its launch crosses 256 / 512 / 768 / 1024
+    workgroups -- a hard staircase, because at 1 wg/CU a leftover tile has no
+    second slot to overlap into. The 32-row tile instead rises smoothly with
+    workgroup count (785 ns at 512, 1234 at 768, 1533 at 1024): at 2 wg/CU its
+    tail pipelines against the wave ahead of it.
 
-    Measured on gfx950 at the production num_heads=16 (index heads per rank at
-    TP4), 128x256 w4 s3 is 1.31-1.55x the 32-row tile on full chunks, ragged
-    batches and two-long-prefill steps, at both chunked-prefill-size 8192 and
-    16384. At num_heads=1 the same config is 0.78x, so the ranking genuinely
-    inverts and one tile cannot serve both.
+    So the comparison is between a step function and a line, and a threshold on
+    either count alone cannot express it -- the crossover is genuinely
+    non-monotone. At num_heads=16 the 128-row tile wins at total_q 1536, loses at
+    2048 for every batch size but 1, then wins again at 3072. That inversion is
+    the staircase: 2048 tokens is exactly 256 large tiles, one perfect wave, so
+    bs=1 wins 1.36x -- but any batch>1 adds grid slack, spills to a second wave
+    and loses 1.43-1.49x. Estimating both costs reproduces this; thresholding
+    does not.
+
+    Measured over 114 shapes -- a grid of num_heads 16/4/1 x total_q 512..16384 x
+    batch 1..16, plus a held-out set of ragged and off-power-of-two ones
+    (num_heads 1/2/4/8/16, [8060, 1x14], [8000, 8000, 50x3], [600]x12, 70k
+    single-sequence). This picks the slower tile on 5 of them, worst 1.53x, and
+    lands within 1.007x of always choosing the measured winner. A rule on
+    num_heads alone gets 28 wrong (1.033x), a fixed 128-row tile 38 (1.051x), and
+    a fixed 32-row tile 74 (1.299x). The two halves agree on the constant, so
+    this is not just fitted to the grid.
     """
     if not args["DISABLE_INDEX_VALUE"]:
         return 64
-    return 128 if args["num_heads"] >= 4 else 32
+    total_q = args["q_ptr"].shape[0]
+    num_heads, batch_size = args["num_heads"], args["batch_size"]
+
+    def workgroups(tile):
+        # The grid gives each sequence its own tiles, so a batch costs batch-1
+        # blocks over the flat token count; those are resident too.
+        return (triton.cdiv(total_q, tile) + batch_size - 1) * num_heads
+
+    small_cost = workgroups(_SCORE_SMALL_TILE) / _SCORE_SMALL_TILE_WAVE
+    large_cost = triton.cdiv(workgroups(_SCORE_LARGE_TILE), _SCORE_LARGE_TILE_WAVE)
+    if small_cost > _SCORE_LARGE_TILE_WAVE_COST * large_cost:
+        return _SCORE_LARGE_TILE
+    return _SCORE_SMALL_TILE
 
 
 def _select_config(configs, named_args, **kwargs):
@@ -162,9 +209,10 @@ def _topk_sort_and_store(
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
         "BLOCK_SIZE_VD": lambda args: triton.next_power_of_2(args["v_head_dim"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
-        # A heuristic rather than a config field: it depends on num_heads, which is
-        # a runtime arg and so invisible to the autotune key. @heuristics runs
-        # before the grid lambda, so the launch below sees the chosen value.
+        # A heuristic rather than a config field: it depends on the token, batch
+        # and head counts, which are runtime args and so invisible to the autotune
+        # key. @heuristics runs before the grid lambda, so the launch below sees
+        # the chosen value.
         "BLOCK_SIZE_Q": _score_block_size_q,
     }
 )
