@@ -101,6 +101,47 @@ def _score_block_size_q(args):
     return _SCORE_SMALL_TILE
 
 
+# Top-k index kernel. The grid is one workgroup per q-row per head -- ~131k of
+# them for a chunked-prefill-8192 step at 16 heads -- so this kernel is bound by
+# how many workgroups a CU keeps resident, not by per-workgroup width. num_warps=1
+# is a single 64-thread wave and maximizes that.
+#
+# Measured on gfx950 (MI355X, 256 CU) over the production shape mix at topk=16:
+# 64w1s2 = 5686.7 us vs 10683.2 us for the 256w4s2 the old autotune space
+# selected, i.e. 1.88x, winning every shape in the mix. The narrowest legal tile
+# at num_warps=1 also won at every other topk measured (8..512). Wider tiles cost
+# monotonically more: 128w1 is 1.14x, 256w4 1.88x, 2048w8 43x.
+#
+# BLOCK_SIZE_K must stay > BLOCK_SIZE_T (static_assert below), so 64 is only legal
+# up to topk=32; _select_topk_config walks up from there. This is not an accuracy
+# trade at any width -- the bitonic merge carries BLOCK_SIZE_K/2 survivors across
+# each chunk boundary, so every legal tile selects the same block set (measured:
+# 0.00% selection drift across all widths over the production mix).
+_TOPK_INDEX_CONFIGS = [
+    triton.Config({"BLOCK_SIZE_K": block_size_k}, num_warps=1, num_stages=2)
+    for block_size_k in (64, 128, 256, 512, 1024, 2048)
+]
+
+
+def _select_topk_config(configs, named_args, **kwargs):
+    """Pin the narrowest single-wave tile this topk allows, instead of measuring.
+
+    Forced rather than autotuned for the same reason as _select_config: the key is
+    BLOCK_SIZE_T alone, so one config is baked per topk bucket for the whole
+    process, chosen on whichever shape happens to run first. The ranking here does
+    not depend on the shape -- narrowest-at-num_warps=1 won every shape and every
+    topk measured -- so there is nothing for a benchmark to discover, and forcing
+    it removes the warmup-order dependence.
+    """
+    block_size_t = {**named_args, **kwargs}["BLOCK_SIZE_T"]
+    return [
+        min(
+            (c for c in configs if c.kwargs["BLOCK_SIZE_K"] > block_size_t),
+            key=lambda c: c.kwargs["BLOCK_SIZE_K"],
+        )
+    ]
+
+
 def _select_config(configs, named_args, **kwargs):
     """Pick the config by code path instead of letting autotune benchmark for it.
 
@@ -532,34 +573,11 @@ def _flash_attn_fwd_with_block_score_kernel(
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
-    configs=[
-        # Large configs for H200/B200 to support larger topk
-        triton.Config({"BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 512}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
-        # Single-wave variants. The grid is one workgroup per q-row per head --
-        # ~131k of them for an 8k chunk at 16 heads -- so this kernel is bound by
-        # how many workgroups a CU keeps resident, not by per-workgroup width. A
-        # 64-thread workgroup is one wave and maximizes that; on MI355X the
-        # narrowest legal tile at num_warps=1 wins at every topk measured (8..512),
-        # by 1.8x at the production topk of 16.
-        #
-        # Added rather than substituted: autotune still selects per BLOCK_SIZE_T,
-        # so the wider configs above remain reachable on hardware where they win.
-        triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=1, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 512}, num_warps=1, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=1, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=1, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=1, num_stages=2),
-    ],
+    configs=_TOPK_INDEX_CONFIGS,
     key=[
         "BLOCK_SIZE_T"
     ],  # use BLOCK_SIZE_T instead of topk to reduce autotune frequency
+    prune_configs_by={"early_config_prune": _select_topk_config},
 )
 @triton.jit
 def _topk_index_kernel(
