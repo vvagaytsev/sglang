@@ -19,21 +19,39 @@ from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 # workgroups serializes into a second wave for ~1.9x the latency, and a
 # chunked-prefill-8192 step sits right on that edge.
 #
-# Measured on gfx950 (MI355X, 256 CU) over the production shape mix at both
-# num_heads=1 and num_heads=16, vs the previous 64x256 w8 s2: 1.08-1.19x total,
-# no shape slower. num_stages=3 over 2 is worth a further ~1.2x here. The CDNA
-# launch knobs (waves_per_eu, matrix_instr_nonkdim) were swept on top of this and
-# moved nothing outside noise, so they are deliberately not set.
-_SCORE_ONLY_CONFIG = triton.Config(
-    {"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_K": 256}, num_warps=4, num_stages=3
-)
+# Measured on gfx950 (MI355X, 256 CU) over the production shape mix vs the previous
+# 64x256 w8 s2. num_stages=3 over 2 is worth ~1.2x. The CDNA launch knobs
+# (waves_per_eu, matrix_instr_nonkdim) were swept on top of this and moved nothing
+# outside noise, so they are deliberately not set. BLOCK_SIZE_Q is a heuristic
+# rather than a config field; see _score_block_size_q.
+_SCORE_ONLY_CONFIG = triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=3)
 
 # DISABLE_INDEX_VALUE=False also stages a V tile, and BLOCK_SIZE_K=256 then needs
 # 305072 B > the 163840 B LDS limit. Every BLOCK_SIZE_K=256 config is unusable here,
 # so this path needs its own BLOCK_SIZE_K<=128 config.
 _WITH_INDEX_VALUE_CONFIG = triton.Config(
-    {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
+    {"BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
 )
+
+
+def _score_block_size_q(args):
+    """Pick BLOCK_SIZE_Q from num_heads, which no autotune config can dispatch on.
+
+    The grid is one workgroup per q-tile per head, so num_heads scales the launch
+    without changing any constexpr the autotune key can see. That matters because
+    the score kernel is residency-bound: on 256 CUs a 128-row tile only pays off
+    once there are enough workgroups to fill the machine, and num_heads is the
+    factor that decides whether a given token count gets there.
+
+    Measured on gfx950 at the production num_heads=16 (index heads per rank at
+    TP4), 128x256 w4 s3 is 1.31-1.55x the 32-row tile on full chunks, ragged
+    batches and two-long-prefill steps, at both chunked-prefill-size 8192 and
+    16384. At num_heads=1 the same config is 0.78x, so the ranking genuinely
+    inverts and one tile cannot serve both.
+    """
+    if not args["DISABLE_INDEX_VALUE"]:
+        return 64
+    return 128 if args["num_heads"] >= 4 else 32
 
 
 def _select_config(configs, named_args, **kwargs):
@@ -144,6 +162,10 @@ def _topk_sort_and_store(
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
         "BLOCK_SIZE_VD": lambda args: triton.next_power_of_2(args["v_head_dim"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
+        # A heuristic rather than a config field: it depends on num_heads, which is
+        # a runtime arg and so invisible to the autotune key. @heuristics runs
+        # before the grid lambda, so the launch below sees the chosen value.
+        "BLOCK_SIZE_Q": _score_block_size_q,
     }
 )
 @triton.autotune(
