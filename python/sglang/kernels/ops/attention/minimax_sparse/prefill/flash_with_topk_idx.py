@@ -542,6 +542,20 @@ def _flash_attn_fwd_with_block_score_kernel(
         triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
+        # Single-wave variants. The grid is one workgroup per q-row per head --
+        # ~131k of them for an 8k chunk at 16 heads -- so this kernel is bound by
+        # how many workgroups a CU keeps resident, not by per-workgroup width. A
+        # 64-thread workgroup is one wave and maximizes that; on MI355X the
+        # narrowest legal tile at num_warps=1 wins at every topk measured (8..512),
+        # by 1.8x at the production topk of 16.
+        #
+        # Added rather than substituted: autotune still selects per BLOCK_SIZE_T,
+        # so the wider configs above remain reachable on hardware where they win.
+        triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 512}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=1, num_stages=2),
     ],
     key=[
         "BLOCK_SIZE_T"
