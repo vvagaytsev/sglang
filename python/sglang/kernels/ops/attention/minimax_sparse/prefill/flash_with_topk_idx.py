@@ -166,6 +166,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
     # seqlens
     cu_seqlens,
+    batch_size,
     seq_lens,
     prefix_lens,
     slot_ids,
@@ -228,10 +229,34 @@ def _flash_attn_fwd_with_block_score_kernel(
     tl.static_assert(BLOCK_SIZE_K >= block_size)
     BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_K // block_size
     # get batch id and head id
-    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bh // num_heads
-    pid_h = pid_bh % num_heads
+    pid_q_global, pid_h = tl.program_id(0), tl.program_id(1)
     pid_kh = pid_h // gqa_group_size
+
+    # Map the flat q-tile id to (batch, tile-within-batch). The grid is the sum
+    # of cdiv(q_len_b, BLOCK_SIZE_Q) instead of batch_size q-tiles per sequence,
+    # so a ragged batch no longer launches a full max_seqlen_q worth of
+    # workgroups for every short sequence just to have them return immediately.
+    # The scan is branchless on purpose: Triton has no `break`, and the trip
+    # count is the batch size, so this is a few scalar ops per workgroup.
+    pid_b = 0
+    tile_start = 0  # q-tiles owned by the batches before pid_b
+    tiles_seen = 0
+    seq_end_prev = tl.load(cu_seqlens)
+    for b in tl.range(0, batch_size):
+        seq_end = tl.load(cu_seqlens + b + 1)
+        n_tiles = tl.cdiv(seq_end - seq_end_prev, BLOCK_SIZE_Q)
+        seq_end_prev = seq_end
+        # This batch lies entirely before pid_q_global.
+        passed = pid_q_global >= tiles_seen + n_tiles
+        pid_b += tl.where(passed, 1, 0)
+        tile_start += tl.where(passed, n_tiles, 0)
+        tiles_seen += n_tiles
+    # The grid is rounded up (see flash_prefill_with_topk_index), so the trailing
+    # workgroups own no q-tile at all.
+    if pid_b >= batch_size:
+        return
+    pid_q = pid_q_global - tile_start
+
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
     q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
@@ -672,7 +697,17 @@ def flash_prefill_with_topk_index(
 
     # launch kernel
     def grid(META):
-        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
+        # The kernel walks a flat q-tile id, so the grid is sum_b cdiv(q_len_b,
+        # BLOCK_SIZE_Q) -- one dimension instead of the old (max q-tiles) x batch,
+        # which launched max_seqlen_q worth of workgroups for every sequence in the
+        # batch and had all but the longest return immediately. cdiv is subadditive
+        # by at most 1 per sequence, so this is an exact upper bound on that sum
+        # and needs no device sync to compute; the kernel returns early on the few
+        # trailing workgroups that own no tile.
+        return (
+            triton.cdiv(total_q, META["BLOCK_SIZE_Q"]) + batch_size - 1,
+            num_heads,
+        )
 
     _flash_attn_fwd_with_block_score_kernel[grid](
         q,
@@ -683,6 +718,7 @@ def flash_prefill_with_topk_index(
         score,
         req_to_token,
         cu_seqlens,
+        batch_size,
         seq_lens,
         prefix_lens,
         slot_ids,
