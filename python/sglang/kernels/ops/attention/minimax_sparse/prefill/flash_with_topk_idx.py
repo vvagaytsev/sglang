@@ -43,6 +43,26 @@ _SCORE_LARGE_TILE_WAVE = 256
 # in 1.1..1.35 gets at most four more of the 114 shapes wrong.
 _SCORE_LARGE_TILE_WAVE_COST = 1.25
 
+# num_heads==1 (MiniMax-M3's single indexer head) is pinned to a 64-row tile rather
+# than run through the wave model below. The model counts workgroups only, so it
+# cannot see that halving the tile doubles the q-tiles and therefore doubles the
+# paged-K re-reads -- free while K is cache-resident, real bandwidth once it is not.
+# The 114-shape fit that produced the model used a small KV pool, so it never saw
+# that axis and picks the 32-row tile here.
+#
+# Measured on gfx950 at the serving geometry (page-size 128, total_q 16384, ctx
+# 82050, bf16 indexer K) against the pre-uplift 64x128 w8 s2, sweeping pool size:
+#
+#   pool    0.02 GB   1.07 GB   4.29 GB   8.59 GB
+#   BQ32      1.45x     1.46x     0.92x     0.92x
+#   BQ64      1.36x     1.36x     1.36x     1.37x
+#
+# The 32-row tile wins by ~7% on a small pool and loses by 1.49x on a serving-sized
+# one; 64 is flat everywhere, so this is pinned rather than re-fitted -- a crossover
+# that has to be right about cache residency is one more thing to get wrong later.
+# num_heads>=4 is untouched: the model picks 128 there and 128 measures fastest.
+_SCORE_SINGLE_HEAD_TILE = 64
+
 
 def _score_block_size_q(args):
     """Pick BLOCK_SIZE_Q from the launch shape, which no autotune config can see.
@@ -62,11 +82,16 @@ def _score_block_size_q(args):
     1.53x, landing within 1.007x of always choosing the measured winner; a
     num_heads rule gets 28 wrong (1.033x), a fixed 128-row tile 38 (1.051x), a
     fixed 32-row tile 74 (1.299x). Both halves agree on the constant.
+
+    The num_heads==1 shortcut below is measured separately and overrides the model;
+    see _SCORE_SINGLE_HEAD_TILE for why the wave count alone is the wrong signal.
     """
     if not args["DISABLE_INDEX_VALUE"]:
         return 64
     total_q = args["q_ptr"].shape[0]
     num_heads, batch_size = args["num_heads"], args["batch_size"]
+    if num_heads == 1:
+        return _SCORE_SINGLE_HEAD_TILE
 
     def workgroups(tile):
         # The grid gives each sequence its own tiles, so a batch costs batch-1
