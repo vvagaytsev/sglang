@@ -1098,8 +1098,8 @@ class Envs:
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_Q = EnvInt(0)
     SGLANG_MINIMAX_SPARSE_BLOCK_SIZE_K = EnvInt(0)
 
-    # Store the MiniMax sparse index-K cache as unit-scaled fp8 instead of bf16 to
-    # halve score-kernel bandwidth; the score kernels widen it back on load.
+    # Decode scoring reads a unit-scaled fp8 copy of MiniMax index-K; prefill
+    # keeps the model-dtype cache. The decode score kernel widens fp8 on load.
     SGLANG_MINIMAX_FP8_INDEX_K = EnvBool(False)
 
     # GEMM / kernel fusion

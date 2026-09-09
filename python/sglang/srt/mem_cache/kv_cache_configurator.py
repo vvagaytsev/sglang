@@ -1242,21 +1242,35 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
-        # Opt in to fp8 (unit-scaled) index-K cache via SGLANG_MINIMAX_FP8_INDEX_K=1
-        # to halve score-kernel bandwidth. Default stays the model dtype; the score
-        # kernels widen fp8 on load (IS_FP8).
         index_dtype = self.model_dtype
+        index_decode_dtype = None
         fp8_index_k = envs.SGLANG_MINIMAX_FP8_INDEX_K.get()
         if fp8_index_k:
+            # HiCache restore and PD state-buffer transfer write index_k_pool
+            # only; they would leave the decode fp8 mirror stale.
+            unsupported = []
+            if self.server_args.enable_hierarchical_cache:
+                unsupported.append("--enable-hierarchical-cache")
+            if self.server_args.disaggregation_mode != "null":
+                unsupported.append(
+                    f"--disaggregation-mode={self.server_args.disaggregation_mode}"
+                )
+            if unsupported:
+                raise ValueError(
+                    "SGLANG_MINIMAX_FP8_INDEX_K is not supported with "
+                    f"{', '.join(unsupported)}: those paths write index-K "
+                    "without updating the fp8 decode mirror."
+                )
             from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
-            index_dtype = (
+            index_decode_dtype = (
                 torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
             )
         logger.info(
-            "MiniMax sparse index-K cache dtype=%s "
+            "MiniMax sparse index-K cache dtype=%s decode_dtype=%s "
             "(SGLANG_MINIMAX_FP8_INDEX_K=%d)",
             index_dtype,
+            index_decode_dtype or index_dtype,
             int(fp8_index_k),
         )
         token_to_kv_pool = MiniMaxSparseKVPool(
@@ -1264,6 +1278,7 @@ class KVCacheConfigurator:
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=index_dtype,
+            index_decode_dtype=index_decode_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],

@@ -4638,6 +4638,7 @@ class MiniMaxSparseKVPool(KVCache):
         disable_value_sparse_layer_ids: Optional[List[int]] = None,
         enable_memory_saver: bool = False,
         index_dtype: Optional[torch.dtype] = None,
+        index_decode_dtype: Optional[torch.dtype] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -4724,11 +4725,33 @@ class MiniMaxSparseKVPool(KVCache):
             else None
         )
 
+        # Same layout as index_k_pool; decode scoring reads this copy when
+        # index_decode_dtype differs. K+V sparse layers are not mirrored.
+        self.index_k_decode_pool: Optional[MHATokenToKOnlyPool] = None
+        if index_decode_dtype is not None and index_decode_dtype != index_dtype:
+            if not local_k_only_sparse_layer_ids:
+                raise ValueError(
+                    "index_decode_dtype is set but this rank has no K-only sparse "
+                    "layers to mirror"
+                )
+            self.index_k_decode_pool = MHATokenToKOnlyPool(
+                size=size,
+                page_size=page_size,
+                dtype=index_decode_dtype,
+                head_num=1,
+                head_dim=idx_head_dim,
+                layer_num=len(local_k_only_sparse_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+
         self.mem_usage = self.main_pool.mem_usage
         if self.index_kv_pool is not None:
             self.mem_usage += self.index_kv_pool.mem_usage
         if self.index_k_pool is not None:
             self.mem_usage += self.index_k_pool.mem_usage
+        if self.index_k_decode_pool is not None:
+            self.mem_usage += self.index_k_decode_pool.mem_usage
 
         # HiCacheController reads these from the top-level KV pool wrapper.
         self.layer_num = self.main_pool.layer_num
@@ -4785,6 +4808,36 @@ class MiniMaxSparseKVPool(KVCache):
             f"layer_id={layer_id} is not a sparse attention layer; "
             f"sparse layers: {list(self.sparse_layer_id_mapping.keys())}"
         )
+
+    def get_index_k_decode_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.index_k_decode_pool is not None:
+            mapped_id = self.index_k_layer_id_mapping.get(layer_id)
+            if mapped_id is not None:
+                self._wait_for_layer(layer_id)
+                return self.index_k_decode_pool.get_key_buffer(mapped_id)
+        return self.get_index_k_buffer(layer_id)
+
+    def set_index_k_decode_mirror(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+    ) -> None:
+        """No-op if the decode index-K mirror is not allocated.
+
+        Direct stores into index_k_pool must call this; set_index_k_buffer already does.
+        """
+        if self.index_k_decode_pool is None:
+            return
+        mapped_id = self.index_k_layer_id_mapping.get(layer_id)
+        if mapped_id is None:
+            return
+        sub_pool = self.index_k_decode_pool
+        mirror = cache_idx_k.reshape(-1, sub_pool.head_num, sub_pool.head_dim)
+        mirror = mirror.to(sub_pool.dtype)
+        if sub_pool.store_dtype != sub_pool.dtype:
+            mirror = mirror.view(sub_pool.store_dtype)
+        sub_pool.k_buffer[mapped_id][loc] = mirror
 
     def set_kv_buffer(
         self,
@@ -4844,6 +4897,7 @@ class MiniMaxSparseKVPool(KVCache):
                 f"sparse group. K-only layers: "
                 f"{list(self.index_k_layer_id_mapping.keys())}"
             )
+        self.set_index_k_decode_mirror(layer.layer_id, loc, cache_idx_k)
         sub_pool = self.index_k_pool
         if cache_idx_k.dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.to(sub_pool.dtype)
@@ -4916,6 +4970,9 @@ class MiniMaxSparseKVPool(KVCache):
                 num_kv_heads=main.head_num,
                 head_bytes=head_bytes,
             )
+            # store_kv_index is a raw byte copy into the index_dtype buffer, so
+            # the mirror needs its own converting store.
+            self.set_index_k_decode_mirror(layer.layer_id, loc, cache_idx_k)
             return
 
         # Fallback: separate stores (identical semantics).
@@ -4926,7 +4983,12 @@ class MiniMaxSparseKVPool(KVCache):
             self.set_index_kv_buffer(layer, loc, cache_idx_k, cache_idx_v)
 
     def get_kv_size_bytes(self):
-        sub_pools = [self.main_pool, self.index_kv_pool, self.index_k_pool]
+        sub_pools = [
+            self.main_pool,
+            self.index_kv_pool,
+            self.index_k_pool,
+            self.index_k_decode_pool,
+        ]
         sizes = [p.get_kv_size_bytes() for p in sub_pools if p is not None]
         return sum(k for k, _ in sizes), sum(v for _, v in sizes)
 
