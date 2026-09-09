@@ -987,6 +987,10 @@ class MiniMaxM3Attention(nn.Module):
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
             )
+            # sparse_qk_index_gemma_rmsnorm_rope_cache writes index_k_pool only.
+            kv_pool.set_index_k_decode_mirror(
+                layer_id, forward_batch.out_cache_loc, idx_k
+            )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)

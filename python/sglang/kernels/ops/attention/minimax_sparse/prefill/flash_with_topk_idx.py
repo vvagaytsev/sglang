@@ -444,7 +444,6 @@ def flash_prefill_with_topk_index(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
     assert k_cache.dtype == q.dtype
     assert cu_seqlens.dtype == torch.int32
