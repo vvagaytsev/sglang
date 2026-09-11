@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 from ..common.utils import (
     SPARSE_KV_FP8_DTYPES,
     check_sparse_kv_fp8,
@@ -20,6 +22,108 @@ from ..common.utils import (
 # caches/pins one winning occupancy config per prefill-length bucket instead of
 # reusing one winner across all M.
 _PREFILL_M_BUCKET_THRESHOLD = 2048
+
+_FWD_OPT = bool(envs.SGLANG_MINIMAX_GQA_SHARE_SPARSE_FWD_OPT.get())
+
+
+@triton.jit
+def _sparse_block_step(
+    # carried softmax accumulators
+    m_i,
+    lse_i,
+    acc_o,
+    # this block's absolute K start (scalar)
+    c,
+    # operands and loop invariants
+    q_qk,
+    k_cache_ptr,
+    v_cache_ptr,
+    r2t_row,
+    seq_len,
+    max_slots,
+    pid_kh,
+    q_row,
+    q_abs_min,
+    off_in_blk,
+    off_kd,
+    off_vd,
+    kd_mask,
+    vd_mask,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    qk_scale,
+    compute_dtype,
+    APPLY_MASK: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_PV: tl.constexpr,
+    FP8_QK: tl.constexpr,
+    Q_IS_FP8: tl.constexpr,
+):
+    """One top-k KV block: paged gather, Q@K, online softmax, P@V.
+
+    APPLY_MASK: when True, apply causal masking on qk; when False, only the
+    seq_len boundary (pos < seq_len). The caller instantiates this twice per
+    tile — unmasked prefix, then masked tail — rather than branching at runtime.
+    """
+    pos = c + off_in_blk
+    pos_ok = pos < seq_len
+    slots = tl.load(r2t_row + pos, mask=pos_ok, other=0)
+    # negative-slot guard; equivalent to `% max_slots` over that guard's domain,
+    # without a 64-bit remainder (no integer divide on AMD)
+    slots = tl.where(slots < 0, slots + max_slots, slots)
+    # int64 before the stride multiply, which overflows int32 past ~16.7M slots
+    slots = slots.to(tl.int64)
+    # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+    k = tl.load(
+        k_cache_ptr
+        + slots[None, :] * stride_ks
+        + pid_kh * stride_kh
+        + off_kd[:, None] * stride_kd,
+        mask=kd_mask[:, None] & pos_ok[None, :],
+        other=0.0,
+    )
+    # fp8 K stays narrow for native / in-kernel fp8 Q@K; otherwise widen before tl.dot
+    # (compiled out when the cache is bf16).
+    if IS_FP8 and not Q_IS_FP8 and not FP8_QK:
+        k = k.to(compute_dtype)
+    # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+    #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
+    qk = tl.dot(q_qk, k) * qk_scale
+    if APPLY_MASK:
+        # Causal: column k is valid iff q_abs >= pos (= c + off_in_blk).
+        col_lim = off_in_blk + (c - q_abs_min)
+        qk = tl.where(q_row[:, None] >= col_lim[None, :], qk, float("-inf"))
+    # compute m_ij and l_ij
+    m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+    p = tl.exp2(qk - m_ij[:, None])
+    l_ij = tl.sum(p, axis=1)
+    # scale acc_o
+    acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+    # paged load V
+    v = tl.load(
+        v_cache_ptr
+        + slots[:, None] * stride_vs
+        + pid_kh * stride_vh
+        + off_vd[None, :] * stride_vd,
+        mask=pos_ok[:, None] & vd_mask[None, :],
+        other=0.0,
+    )
+    # fp8 V stays narrow for fp8 P@V; otherwise widen so P casts to compute dtype.
+    if IS_FP8 and not FP8_PV:
+        v = v.to(compute_dtype)
+    if IS_FP8 and FP8_PV:
+        # Match SILOTIGER-762 baseline: clamp P before the fp8 cast (V kept fp8 above).
+        p = tl.minimum(p, 448.0).to(v.dtype)
+    else:
+        p = p.to(v.dtype)
+    acc_o += tl.dot(p, v)
+    # update statistics
+    lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+    return m_ij, lse_i, acc_o
 
 
 @triton.heuristics(
@@ -121,6 +225,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    SPLIT_MASK: tl.constexpr,
     FP8_PV: tl.constexpr,
     FP8_QK: tl.constexpr,
     Q_IS_FP8: tl.constexpr,
@@ -166,12 +271,16 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    if SPLIT_MASK:
+        r2t_row = req_to_token_ptr + sid * stride_r2t_b
+        # flat accumulator row -> query index in the tile (q-major after reshape)
+        q_row = tl.arange(0, BLOCK_SIZE_QH) // BLOCK_SIZE_H
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
         # we assume that the topk_idx is right padded with -1
-        off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         valid_idx = tl.where(topk_idx >= 0, off_t, -1)
         real_topk = tl.sum(valid_idx != -1, axis=0)
@@ -186,13 +295,6 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        # init statistics
-        off_q_k = (
-            tl.arange(0, BLOCK_SIZE_Q)[:, None]
-            + pid_q_j * BLOCK_SIZE_Q
-            + prefix_len
-            - tl.arange(0, BLOCK_SIZE_K)[None, :]
-        )
         if HAS_SINK:
             m_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
             lse_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
@@ -229,84 +331,177 @@ def _gqa_share_sparse_fwd_kernel(
             qk_scale = sm_scale_log2e / q_scale
         else:
             q_qk = q
-        # sparse attention
-        for i in range(real_topk):
-            # get current block start index (absolute K position)
-            c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
-            t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_ks
-                + pid_kh * stride_kh
-                + off_kd[:, None] * stride_kd,
-                mask=kd_mask[:, None] & pos_mask[None, :],
-                other=0.0,
+        # split-mask opt vs always-masked baseline.
+        if SPLIT_MASK:
+            # smallest absolute query position in this tile
+            q_abs_min = pid_q_j * BLOCK_SIZE_Q + prefix_len
+            # length of the leading run of blocks that provably need no causal
+            # mask; padding (-1) counts as needing one, which ends the run
+            needs_mask = (
+                (topk_idx < 0) | (topk_idx * BLOCK_SIZE_K > q_abs_min - BLOCK_SIZE_K + 1)
+            ).to(tl.int32)
+            n_pre = tl.sum((tl.cumsum(needs_mask, axis=0) == 0).to(tl.int32), axis=0)
+            n_pre = min(n_pre, real_topk)
+            for i in range(n_pre):
+                c = tl.load(t_ptr_j + i * stride_tk).to(tl.int32) * BLOCK_SIZE_K
+                m_i, lse_i, acc_o = _sparse_block_step(
+                    m_i,
+                    lse_i,
+                    acc_o,
+                    c,
+                    q_qk,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    r2t_row,
+                    seq_len,
+                    max_slots,
+                    pid_kh,
+                    q_row,
+                    q_abs_min,
+                    off_n,
+                    off_kd,
+                    off_vd,
+                    kd_mask,
+                    vd_mask,
+                    stride_ks,
+                    stride_kh,
+                    stride_kd,
+                    stride_vs,
+                    stride_vh,
+                    stride_vd,
+                    qk_scale,
+                    compute_dtype,
+                    APPLY_MASK=False,
+                    IS_FP8=IS_FP8,
+                    FP8_PV=FP8_PV,
+                    FP8_QK=FP8_QK,
+                    Q_IS_FP8=Q_IS_FP8,
+                )
+            # Sync prefix → masked tail: without it, LDS scratch from the first loop is
+            # reused too early and output is nondeterministic on some gfx950 autotune configs.
+            # n_pre and real_topk are workgroup-uniform, so the barrier cannot deadlock.
+            tl.debug_barrier()
+            for i in range(n_pre, real_topk):
+                c = tl.load(t_ptr_j + i * stride_tk).to(tl.int32) * BLOCK_SIZE_K
+                m_i, lse_i, acc_o = _sparse_block_step(
+                    m_i,
+                    lse_i,
+                    acc_o,
+                    c,
+                    q_qk,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    r2t_row,
+                    seq_len,
+                    max_slots,
+                    pid_kh,
+                    q_row,
+                    q_abs_min,
+                    off_n,
+                    off_kd,
+                    off_vd,
+                    kd_mask,
+                    vd_mask,
+                    stride_ks,
+                    stride_kh,
+                    stride_kd,
+                    stride_vs,
+                    stride_vh,
+                    stride_vd,
+                    qk_scale,
+                    compute_dtype,
+                    APPLY_MASK=True,
+                    IS_FP8=IS_FP8,
+                    FP8_PV=FP8_PV,
+                    FP8_QK=FP8_QK,
+                    Q_IS_FP8=Q_IS_FP8,
+                )
+        else:
+            # causal mask is folded into the qk accumulator before tl.dot.
+            off_q_k = (
+                tl.arange(0, BLOCK_SIZE_Q)[:, None]
+                + pid_q_j * BLOCK_SIZE_Q
+                + prefix_len
+                - tl.arange(0, BLOCK_SIZE_K)[None, :]
             )
-            if IS_FP8:
-                if Q_IS_FP8:
-                    # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
-                    pass
-                elif FP8_QK:
-                    # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
-                    pass
+            # sparse attention
+            for i in range(real_topk):
+                # get current block start index (absolute K position)
+                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                t_ptr_j = t_ptr_j + stride_tk
+                # paged load K via req_to_token: pos -> slot -> k_cache
+                pos = c + off_n
+                pos_mask = pos < seq_len
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+                # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_ks
+                    + pid_kh * stride_kh
+                    + off_kd[:, None] * stride_kd,
+                    mask=kd_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    if Q_IS_FP8:
+                        # Q already fp8 -> native fp8 Q@K, keep K fp8 (no widen).
+                        pass
+                    elif FP8_QK:
+                        # in-kernel fp8 Q@K -> keep K fp8 (drops the widen cvt).
+                        pass
+                    else:
+                        # fp8 main K cache is unit-scaled; widen to the compute dtype
+                        # before the tl.dot (compiled out when the cache is bf16).
+                        k = k.to(compute_dtype)
+                # compute qk
+                qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+                # causal mask
+                qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
+                qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+                # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+                #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]. qk_scale folds the FP8_QK
+                # Q-scale inverse into sm_scale (== sm_scale_log2e when FP8_QK is off).
+                qk += tl.dot(q_qk, k) * qk_scale
+                # K boundary mask: positions beyond seq_len contribute -inf
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+                # paged load V
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vs
+                    + pid_kh * stride_vh
+                    + off_vd[None, :] * stride_vd,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    if FP8_PV:
+                        # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
+                        pass
+                    else:
+                        # Widen V so `p.to(v.dtype)` casts P to the compute dtype
+                        # rather than fp8 (which would wreck attn-weight precision).
+                        v = v.to(compute_dtype)
+                # online softmax: running max + per-tile acc_o rescale.
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                if FP8_PV and IS_FP8:
+                    # cast P to fp8 for the P@V MFMA (V kept fp8 above). P in [0, 1]
+                    # here, so the clamp only guards a stray rounding overflow.
+                    p_cast = tl.minimum(p, 448.0).to(v.dtype)
                 else:
-                    # fp8 main K cache is unit-scaled; widen to the compute dtype
-                    # before the tl.dot (compiled out when the cache is bf16).
-                    k = k.to(compute_dtype)
-            # compute qk
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal mask
-            qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]. qk_scale folds the FP8_QK
-            # Q-scale inverse into sm_scale (== sm_scale_log2e when FP8_QK is off).
-            qk += tl.dot(q_qk, k) * qk_scale
-            # K boundary mask: positions beyond seq_len contribute -inf
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vs
-                + pid_kh * stride_vh
-                + off_vd[None, :] * stride_vd,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                if FP8_PV:
-                    # keep V in fp8 for a fp8 P@V MFMA (drops the widen cvt).
-                    pass
-                else:
-                    # Widen V so `p.to(v.dtype)` casts P to the compute dtype
-                    # rather than fp8 (which would wreck attn-weight precision).
-                    v = v.to(compute_dtype)
-            # online softmax: running max + per-tile acc_o rescale.
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            if FP8_PV and IS_FP8:
-                # cast P to fp8 for the P@V MFMA (V kept fp8 above). P in [0, 1]
-                # here, so the clamp only guards a stray rounding overflow.
-                p_cast = tl.minimum(p, 448.0).to(v.dtype)
-            else:
-                p_cast = p.to(v.dtype)
-            acc_o += tl.dot(p_cast, v)
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+                    p_cast = p.to(v.dtype)
+                acc_o += tl.dot(p_cast, v)
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
@@ -439,6 +634,7 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        SPLIT_MASK=_FWD_OPT,
         FP8_PV=fp8_pv,
         FP8_QK=fp8_qk,
         Q_IS_FP8=q_is_fp8,
