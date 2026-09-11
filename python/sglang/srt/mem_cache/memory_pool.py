@@ -30,7 +30,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeGuard, Union
 
 import numpy as np
 import torch
@@ -47,6 +47,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
+    store_k_slots,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -129,6 +130,63 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _kv_scale_divides(
+    scale: Optional[Union[float, torch.Tensor]],
+) -> TypeGuard[Union[float, torch.Tensor]]:
+    """Whether dividing by ``scale`` would change any value.
+
+    Case 1, ``None``: no scale was supplied, so there is nothing to apply.
+
+    Case 2, a tensor: this is ``layer.k_scale``, the Parameter that
+    ``BaseKVCacheMethod.create_weights`` allocates and weight loading fills. Reading
+    its value would copy device to host, stalling on the GPU and breaking CUDA-graph
+    capture, so assume it matters and divide.
+
+    Case 3, a float: already on the host, so compare it and skip the divide when it
+    is exactly 1.0. For example, the MiniMax sparse store passes no scale argument
+    and so gets ``MiniMaxSparseKVPool.set_kv_buffer``'s 1.0 default.
+    """
+    if scale is None:
+        return False
+    if isinstance(scale, torch.Tensor):
+        return True
+    return scale != 1.0
+
+
+def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
+    """Whether ``t`` is addressable as ``token * t.stride(0) + head * head_dim + dim``.
+
+    That is all ``reshape_and_cache_flash`` needs, since it takes the token stride per
+    source. So a ``dim=-1`` slice of fused QKV qualifies; ``is_contiguous`` would not.
+    """
+    row = head_num * head_dim
+    if t.is_contiguous():
+        return t.numel() % row == 0
+    if t.dim() == 2:
+        return t.shape[1] == row and t.stride(1) == 1
+    if t.dim() == 3:
+        return (
+            t.shape[1] == head_num
+            and t.shape[2] == head_dim
+            and t.stride(1) == head_dim
+            and t.stride(2) == 1
+        )
+    return False
+
+
+def _as_token_head_dim(t: torch.Tensor, head_num: int, head_dim: int) -> torch.Tensor:
+    """View ``t`` as ``[tokens, head_num, head_dim]`` without moving data.
+
+    Splits only the trailing block, so a strided token dimension survives. Guard with
+    :func:`_has_dense_kv_rows`.
+    """
+    if t.dim() == 3 and t.shape[1] == head_num and t.shape[2] == head_dim:
+        return t
+    if t.dim() == 2 and t.shape[1] == head_num * head_dim:
+        return t.unflatten(1, (head_num, head_dim))
+    return t.view(-1, head_num, head_dim)
 
 
 def _set_kv_buffer_impl(
@@ -2241,6 +2299,58 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def can_store_kv_fused_cast(
+        self,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+    ) -> bool:
+        """Whether the pending dtype cast can be folded into the paged write.
+
+        ``reshape_and_cache_flash`` converts on store, so the separate ``.to(self.dtype)``
+        is only needed when this returns False. It reuses K's head geometry for V and
+        applies no scale, so mismatched shapes or a real scale fall back.
+        """
+        if self.kv_cache_layout != "nhd" or self.use_hnd:
+            return False
+        if self.is_quantized_kv_cache or self.store_dtype != torch.uint8:
+            return False
+        if cache_k.dtype == self.dtype or cache_k.dtype != cache_v.dtype:
+            return False
+        if self.head_dim != self.v_head_dim:
+            return False
+        if _kv_scale_divides(k_scale) or _kv_scale_divides(v_scale):
+            return False
+        return (
+            _has_dense_kv_rows(cache_k, self.head_num, self.head_dim)
+            and _has_dense_kv_rows(cache_v, self.head_num, self.head_dim)
+            and cache_k.shape == cache_v.shape
+        )
+
+    def store_kv_fused_cast(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        """Cast K/V to the cache dtype and scatter both in one launch.
+
+        Guard with :meth:`can_store_kv_fused_cast`.
+        """
+        from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
+
+        # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
+        # slot-indexed buffer as page-size 1.
+        launch_reshape_and_cache_flash(
+            _as_token_head_dim(cache_k, self.head_num, self.head_dim),
+            _as_token_head_dim(cache_v, self.head_num, self.head_dim),
+            self._get_key_buffer(layer_id).unsqueeze(1),
+            self._get_value_buffer(layer_id).unsqueeze(1),
+            loc,
+        )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2276,9 +2386,9 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2649,9 +2759,9 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2997,9 +3107,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
@@ -4849,7 +4959,12 @@ class MiniMaxSparseKVPool(KVCache):
             cache_idx_k = cache_idx_k.to(sub_pool.dtype)
         if sub_pool.store_dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
-        sub_pool.k_buffer[mapped_id][loc] = cache_idx_k
+        k_buffer = sub_pool.k_buffer[mapped_id]
+        if cache_idx_k.is_contiguous():
+            store_k_slots(k_buffer, cache_idx_k.view(-1, *k_buffer.shape[1:]), loc)
+        else:
+            # store_k_slots requires contiguous rows.
+            k_buffer[loc] = cache_idx_k
 
     def _can_fuse_kv_index_store(
         self,
@@ -4918,8 +5033,12 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics).
-        self.set_kv_buffer(layer, loc, cache_k, cache_v)
+        if self.main_pool.can_store_kv_fused_cast(cache_k, cache_v):
+            # Folds the cast into the paged write: one launch, not cast + scatter.
+            self.main_pool.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
+        else:
+            # Fallback: separate stores (identical semantics).
+            self.set_kv_buffer(layer, loc, cache_k, cache_v)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k)
         else:
