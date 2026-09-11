@@ -8,46 +8,171 @@ import triton.language as tl
 
 from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 
+# Score-only path (DISABLE_INDEX_VALUE=True), i.e. every sparse layer of MiniMax-M3.
+#
+# Occupancy decides this one, and the limit is VGPRs, not LDS: num_warps=4 puts one
+# wave per SIMD so a CU holds 2 workgroups, where num_warps=8 fits only 1 and a
+# launch crossing 256 workgroups then serializes into a second wave for ~1.9x the
+# latency -- which a chunked-prefill-8192 step sits right on. Measured on gfx950
+# (MI355X, 256 CU) over the production shape mix vs the previous 64x256 w8 s2;
+# num_stages=3 over 2 is worth ~1.2x. The CDNA launch knobs (waves_per_eu,
+# matrix_instr_nonkdim) moved nothing outside noise, so they are left unset.
+# BLOCK_SIZE_Q is a heuristic rather than a config field; see _score_block_size_q.
+_SCORE_ONLY_CONFIG = triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=3)
+
+# DISABLE_INDEX_VALUE=False also stages a V tile, and BLOCK_SIZE_K=256 then needs
+# 305072 B > the 163840 B LDS limit. Every BLOCK_SIZE_K=256 config is unusable here,
+# so this path needs its own BLOCK_SIZE_K<=128 config.
+_WITH_INDEX_VALUE_CONFIG = triton.Config(
+    {"BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
+)
+
+
+# The two BLOCK_SIZE_Q the score path chooses between, and the workgroups of each
+# that gfx950's 256 CUs hold at once: at BLOCK_SIZE_K=256 / num_warps=4 the 32-row
+# tile fits two per CU and the 128-row tile one.
+_SCORE_SMALL_TILE = 32
+_SCORE_LARGE_TILE = 128
+_SCORE_SMALL_TILE_WAVE = 512
+_SCORE_LARGE_TILE_WAVE = 256
+
+# What one wave of 128-row tiles costs in units of a full 32-row launch. Measured
+# per-wave it is 1113 vs 785 ns (1.42), but that overstates the large tile: its
+# waves are a ceiling, so a partly-filled last wave is charged whole. Fitting the
+# crossover puts the effective ratio at 1.25, and the optimum is flat -- anything
+# in 1.1..1.35 gets at most four more of the 114 shapes wrong.
+_SCORE_LARGE_TILE_WAVE_COST = 1.25
+
+# num_heads==1 (MiniMax-M3's single indexer head) is pinned to a 64-row tile rather
+# than run through the wave model below. The model counts workgroups only, so it
+# cannot see that halving the tile doubles the q-tiles and therefore doubles the
+# paged-K re-reads -- free while K is cache-resident, real bandwidth once it is not.
+# The 114-shape fit that produced the model used a small KV pool, so it never saw
+# that axis and picks the 32-row tile here.
+#
+# Measured on gfx950 at the serving geometry (page-size 128, total_q 16384, ctx
+# 82050, bf16 indexer K) against the pre-uplift 64x128 w8 s2, sweeping pool size:
+#
+#   pool    0.02 GB   1.07 GB   4.29 GB   8.59 GB
+#   BQ32      1.45x     1.46x     0.92x     0.92x
+#   BQ64      1.36x     1.36x     1.36x     1.37x
+#
+# The 32-row tile wins by ~7% on a small pool and loses by 1.49x on a serving-sized
+# one; 64 is flat everywhere, so this is pinned rather than re-fitted -- a crossover
+# that has to be right about cache residency is one more thing to get wrong later.
+# num_heads>=4 is untouched: the model picks 128 there and 128 measures fastest.
+_SCORE_SINGLE_HEAD_TILE = 64
+
+
+def _score_block_size_q(args):
+    """Pick BLOCK_SIZE_Q from the launch shape, which no autotune config can see.
+
+    The autotune key holds only dtypes and layout constexprs, so a Config cannot
+    dispatch on the token and head counts that decide this. Both tiles are
+    occupancy-bound but retire workgroups differently: at 1 wg/CU the 128-row tile
+    is a staircase in workgroup count (1128 -> 2222 -> 3336 ns across 256 / 512 /
+    768), while at 2 wg/CU the 32-row tile rises smoothly (785 -> 1234 -> 1533 ns)
+    because its tail pipelines into the wave ahead. Comparing a step function to a
+    line makes the crossover non-monotone -- at num_heads=16 the large tile wins at
+    total_q 1536, loses at 2048 for every batch but 1, wins again at 3072 -- so
+    both costs are estimated rather than thresholded on either count.
+
+    Measured over 114 shapes (num_heads 16/4/1 x total_q 512..16384 x batch 1..16,
+    plus a held-out ragged/off-power-of-two set). Picks the slower tile on 5, worst
+    1.53x, landing within 1.007x of always choosing the measured winner; a
+    num_heads rule gets 28 wrong (1.033x), a fixed 128-row tile 38 (1.051x), a
+    fixed 32-row tile 74 (1.299x). Both halves agree on the constant.
+
+    The num_heads==1 shortcut below is measured separately and overrides the model;
+    see _SCORE_SINGLE_HEAD_TILE for why the wave count alone is the wrong signal.
+    """
+    if not args["DISABLE_INDEX_VALUE"]:
+        return 64
+    total_q = args["q_ptr"].shape[0]
+    num_heads, batch_size = args["num_heads"], args["batch_size"]
+    if num_heads == 1:
+        return _SCORE_SINGLE_HEAD_TILE
+
+    def workgroups(tile):
+        # The grid gives each sequence its own tiles, so a batch costs batch-1
+        # blocks over the flat token count; those are resident too.
+        return (triton.cdiv(total_q, tile) + batch_size - 1) * num_heads
+
+    small_cost = workgroups(_SCORE_SMALL_TILE) / _SCORE_SMALL_TILE_WAVE
+    large_cost = triton.cdiv(workgroups(_SCORE_LARGE_TILE), _SCORE_LARGE_TILE_WAVE)
+    if small_cost > _SCORE_LARGE_TILE_WAVE_COST * large_cost:
+        return _SCORE_LARGE_TILE
+    return _SCORE_SMALL_TILE
+
+
+# Top-k index kernel. The grid is one workgroup per q-row per head -- ~131k of them
+# for a chunked-prefill-8192 step at 16 heads -- so this is bound by how many
+# workgroups a CU keeps resident, not by per-workgroup width, and num_warps=1 (a
+# single 64-thread wave) maximizes that. Measured on gfx950 (MI355X, 256 CU) at
+# topk=16 over the production shape mix: 64w1s2 = 5686.7 us vs 10683.2 us for the
+# 256w4s2 the old autotune space selected (1.88x), winning every shape; the
+# narrowest legal tile at num_warps=1 also won at every topk from 8 to 512.
+#
+# BLOCK_SIZE_K must stay > BLOCK_SIZE_T (static_assert below), so 64 is only legal
+# up to topk=32 and _select_topk_config walks up from there. Width is not an
+# accuracy trade: the bitonic merge carries BLOCK_SIZE_K/2 survivors across each
+# chunk boundary, so every legal tile selects the same block set (measured 0.00%
+# drift).
+_TOPK_INDEX_CONFIGS = [
+    triton.Config({"BLOCK_SIZE_K": block_size_k}, num_warps=1, num_stages=2)
+    for block_size_k in (64, 128, 256, 512, 1024, 2048)
+]
+
+
+def _select_topk_config(configs, named_args, **kwargs):
+    """Pin the narrowest single-wave tile this topk allows, instead of measuring.
+
+    Forced rather than autotuned for the same reason as _select_config: the key is
+    BLOCK_SIZE_T alone, so one config is baked per topk bucket for the whole
+    process, chosen on whichever shape ran first. The ranking does not depend on
+    the shape (see _TOPK_INDEX_CONFIGS), so there is nothing for a benchmark to
+    discover and pinning removes the warmup-order dependence.
+    """
+    block_size_t = {**named_args, **kwargs}["BLOCK_SIZE_T"]
+    return [
+        min(
+            (c for c in configs if c.kwargs["BLOCK_SIZE_K"] > block_size_t),
+            key=lambda c: c.kwargs["BLOCK_SIZE_K"],
+        )
+    ]
+
+
+def _select_config(configs, named_args, **kwargs):
+    """Pick the config by code path instead of letting autotune benchmark for it.
+
+    The autotune key holds only dtype/layout constexprs, so it cannot see the token
+    layout that actually decides the winner. Autotune therefore measures whichever
+    shape a process happens to run first and reuses that choice for every later
+    shape -- and on a short warmup shape the two configs tie, so it can settle on
+    the slower one for the whole process. Forcing the mapping keeps selection
+    deterministic across restarts.
+    """
+    disable_index_value = {**named_args, **kwargs}["DISABLE_INDEX_VALUE"]
+    return [_SCORE_ONLY_CONFIG if disable_index_value else _WITH_INDEX_VALUE_CONFIG]
+
 
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
         "BLOCK_SIZE_VD": lambda args: triton.next_power_of_2(args["v_head_dim"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
+        # A heuristic, not a config field: it depends on runtime token/batch/head
+        # counts, invisible to the autotune key. @heuristics runs before the grid
+        # lambda, so the launch below sees the chosen value.
+        "BLOCK_SIZE_Q": _score_block_size_q,
     }
 )
 @triton.autotune(
     configs=[
-        # Small block (64x64): low shared mem, can use higher num_stages
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
-        ),
-        # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
-        ),
-        # Large block (128x128): high shared mem, ns=2,3 only, nw=8
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
+        # _select_config forces one of these two per code path, so nothing here is
+        # benchmarked against anything else.
+        _SCORE_ONLY_CONFIG,
+        _WITH_INDEX_VALUE_CONFIG,
     ],
     key=[
         "qk_head_dim",
@@ -57,6 +182,7 @@ from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
     ],
+    prune_configs_by={"early_config_prune": _select_config},
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
@@ -69,6 +195,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
     # seqlens
     cu_seqlens,
+    batch_size,
     seq_lens,
     prefix_lens,
     slot_ids,
@@ -118,10 +245,33 @@ def _flash_attn_fwd_with_block_score_kernel(
     tl.static_assert(BLOCK_SIZE_K >= block_size)
     BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_K // block_size
     # get batch id and head id
-    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bh // num_heads
-    pid_h = pid_bh % num_heads
+    pid_q_global, pid_h = tl.program_id(0), tl.program_id(1)
     pid_kh = pid_h // gqa_group_size
+
+    # Map the flat q-tile id to (batch, tile-within-batch). The grid is now the sum
+    # of cdiv(q_len_b, BLOCK_SIZE_Q) rather than max q-tiles per sequence, so a
+    # ragged batch no longer launches max_seqlen_q worth of workgroups for every
+    # short sequence just to have them return immediately. Branchless because
+    # Triton has no `break`, and the trip count is the batch size.
+    pid_b = 0
+    tile_start = 0  # q-tiles owned by the batches before pid_b
+    tiles_seen = 0
+    seq_end_prev = tl.load(cu_seqlens)
+    for b in tl.range(0, batch_size):
+        seq_end = tl.load(cu_seqlens + b + 1)
+        n_tiles = tl.cdiv(seq_end - seq_end_prev, BLOCK_SIZE_Q)
+        seq_end_prev = seq_end
+        # This batch lies entirely before pid_q_global.
+        passed = pid_q_global >= tiles_seen + n_tiles
+        pid_b += tl.where(passed, 1, 0)
+        tile_start += tl.where(passed, n_tiles, 0)
+        tiles_seen += n_tiles
+    # The grid is rounded up (see flash_prefill_with_topk_index), so the trailing
+    # workgroups own no q-tile at all.
+    if pid_b >= batch_size:
+        return
+    pid_q = pid_q_global - tile_start
+
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
     q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
@@ -275,20 +425,11 @@ def _flash_attn_fwd_with_block_score_kernel(
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
-    configs=[
-        # Large configs for H200/B200 to support larger topk
-        triton.Config({"BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 512}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
-    ],
+    configs=_TOPK_INDEX_CONFIGS,
     key=[
         "BLOCK_SIZE_T"
     ],  # use BLOCK_SIZE_T instead of topk to reduce autotune frequency
+    prune_configs_by={"early_config_prune": _select_topk_config},
 )
 @triton.jit
 def _topk_index_kernel(
@@ -301,6 +442,7 @@ def _topk_index_kernel(
     cu_seqlens,
     cu_seqblocks_q,
     prefix_lens,
+    batch_size,
     # shape
     topk,  # not constexpr to avoid recompilation when topk changes
     init_blocks: tl.constexpr,
@@ -321,17 +463,24 @@ def _topk_index_kernel(
     tl.static_assert(
         BLOCK_SIZE_K > BLOCK_SIZE_T
     )  # use BLOCK_SIZE_T instead of topk (stricter but safe)
-    # get batch id and head id
-    pid_q = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_h = tl.program_id(2)
+    pid_q_global, pid_h = tl.program_id(0), tl.program_id(1)
+
+    # Map the flat q-block id to (batch, block-within-batch) as the score kernel
+    # does, except cu_seqblocks_q is already that prefix sum so the scan need only
+    # count batches ending at or before this id. Dim 0 was (max q-blocks) over a
+    # batch dimension, sizing every sequence by the longest: a [8060, 1 x 14] batch
+    # launched 8060 blocks fifteen times, fourteen of which returned immediately.
+    pid_b = 0
+    for b in tl.range(0, batch_size):
+        pid_b += tl.where(pid_q_global >= tl.load(cu_seqblocks_q + b + 1), 1, 0)
+    # all_seqblock_q is exact, so this only fires if a caller rounds the grid up.
+    if pid_b >= batch_size:
+        return
+    block_start = tl.load(cu_seqblocks_q + pid_b)
+    pid_q = pid_q_global - block_start
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
-    block_start = tl.load(cu_seqblocks_q + pid_b)
-    block_num = tl.load(cu_seqblocks_q + pid_b + 1) - block_start
     prefix_len = tl.load(prefix_lens + pid_b)
-    if pid_q >= block_num:
-        return
     # offsets
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_t = tl.arange(0, BLOCK_SIZE_T)
@@ -403,11 +552,10 @@ def _topk_index_kernel(
         axis=0,
     )
     # save topk
+    # block_start + pid_q is pid_q_global by construction: the flat id already
+    # indexes topk_idx's [all_seqblock_q] row dimension.
     ti_ptrs = (
-        ti_ptr
-        + (block_start + pid_q) * stride_ti_n
-        + pid_h * stride_ti_h
-        + off_t * stride_ti_t
+        ti_ptr + pid_q_global * stride_ti_n + pid_h * stride_ti_h + off_t * stride_ti_t
     )
     topk_mask = tl.arange(0, BLOCK_SIZE_T) < min(topk, valid_blocks)
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=topk_mask)
@@ -468,8 +616,11 @@ def flash_prefill_with_topk_index(
     ), "init_blocks + local_blocks must be less than topk"
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
-        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+    # max_seqblock_q is accepted for call compatibility but no longer read: it
+    # sized the old dense top-k grid, which the flat q-block grid replaced.
+    del max_seqblock_q
+    if cu_seqblocks_q is None or all_seqblock_q is None:
+        cu_seqblocks_q, _, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
@@ -477,6 +628,12 @@ def flash_prefill_with_topk_index(
         o = None
     else:
         o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
+    topk_idx = torch.full(
+        (num_heads, all_seqblock_q, topk),
+        fill_value=-1,
+        device=q.device,
+        dtype=torch.int32,
+    )
     score = torch.full(
         (num_heads, total_q, max_seqblock_k),
         float("-inf"),
@@ -486,7 +643,15 @@ def flash_prefill_with_topk_index(
 
     # launch kernel
     def grid(META):
-        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
+        # The kernel walks a flat q-tile id, so the grid is sum_b cdiv(q_len_b,
+        # BLOCK_SIZE_Q) -- one dimension instead of the old (max q-tiles) x batch.
+        # cdiv is subadditive by at most 1 per sequence, so this is an exact upper
+        # bound on that sum needing no device sync; the kernel returns early on the
+        # few trailing workgroups that own no tile.
+        return (
+            triton.cdiv(total_q, META["BLOCK_SIZE_Q"]) + batch_size - 1,
+            num_heads,
+        )
 
     _flash_attn_fwd_with_block_score_kernel[grid](
         q,
@@ -497,6 +662,7 @@ def flash_prefill_with_topk_index(
         score,
         req_to_token,
         cu_seqlens,
+        batch_size,
         seq_lens,
         prefix_lens,
         slot_ids,
@@ -531,15 +697,10 @@ def flash_prefill_with_topk_index(
         DISABLE_INDEX_VALUE=disable_index_value,
     )
 
-    # topk extraction kernel
-    topk_idx = torch.full(
-        (num_heads, all_seqblock_q, topk),
-        fill_value=-1,
-        device=score.device,
-        dtype=torch.int32,
-    )
-    # launch kernel
-    grid = (max_seqblock_q, batch_size, num_heads)
+    # topk extraction kernel, on the same flat grid: one workgroup per real q-block
+    # per head, not max_seqblock_q per sequence. all_seqblock_q is the exact sum,
+    # so unlike the score grid this needs no batch-1 slack.
+    grid = (all_seqblock_q, num_heads)
     _topk_index_kernel[grid](
         score,
         topk_idx,
@@ -548,6 +709,7 @@ def flash_prefill_with_topk_index(
         cu_seqlens,
         cu_seqblocks_q,
         prefix_lens,
+        batch_size,
         topk,
         init_blocks,
         local_blocks,
