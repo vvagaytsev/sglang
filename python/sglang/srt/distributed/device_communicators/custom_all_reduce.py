@@ -70,6 +70,8 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
+        # Only tracked on ROCm, where the IPC-exported buffers come from torch.
+        self.expandable_segments = False
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -126,7 +128,13 @@ class CustomAllreduce:
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+            self.expandable_segments = _expandable_segments_enabled()
+            # `self.buffer` is exported with hipIpcGetMemHandle, which rejects
+            # the VMM-backed memory of an expandable segment.
+            with _expandable_segments_disabled(self.expandable_segments):
+                self.buffer = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr
@@ -144,6 +152,12 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        # Tensors captured into a graph come from the caching allocator, so with
+        # expandable segments they cannot be exported to peers either; copy them
+        # into the pre-registered `self.buffer` instead.
+        self.register_graph_inputs = not (
+            self.tms_cudagraph or self.expandable_segments
+        )
 
     @staticmethod
     def create_shared_buffer(
@@ -346,7 +360,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input, registered=self.register_graph_inputs
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -443,6 +459,30 @@ def dispatch_custom_allreduce(
             return CustomAllreduce
 
     return CustomAllreduce
+
+
+def _expandable_segments_enabled() -> bool:
+    """Return whether the caching allocator is using expandable segments."""
+    # torch only gained a direct getter for this setting in 2.12; the snapshot
+    # carries it on every version the ROCm images ship.
+    settings = torch.cuda.memory._snapshot()["allocator_settings"]
+    return bool(settings["expandable_segments"])
+
+
+@contextmanager
+def _expandable_segments_disabled(enabled: bool):
+    """Allocate from regular segments inside the block, then restore the setting.
+
+    `enabled` is the current setting, as returned by `_expandable_segments_enabled()`.
+    """
+    if not enabled:
+        yield
+        return
+    torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
 
 def _use_amd_deterministic_impl() -> bool:
